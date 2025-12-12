@@ -1,12 +1,13 @@
 /**
- * Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)
+ * Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) - BEACON
  * - Raw LoRa TX/RX (no LoRaWAN)
  * - INA219 current sampling + EMA filter (SIGNED current supported)
  * - GPS (GT-U7) on UART pins 45/46
- *   - Serial GPS dump
- *   - OLED shows: HDOP, ALT, LAT/LON (AVERAGED)
- *   - GPS quality indicator: POOR / NORMAL / EXCELLENT
- * - Broadcast ALL stats as a binary struct over LoRa + CRC16
+ * - Broadcast TelemetryPacket over LoRa + CRC16 (PING)
+ * - On ACK (PONG), logs:
+ *     1) Original ping seq
+ *     2) Receiver-measured metrics for ping (beacon TX data)
+ *     3) Beacon-measured metrics for ACK (beacon RX data)
  */
 
 #define HELTEC_POWER_BUTTON
@@ -32,9 +33,9 @@ static const float ZERO_DEADBAND_mA = 3.0f;
 
 enum InaRangePreset
 {
-    INA_32V_2A,
-    INA_32V_1A,
-    INA_16V_400mA
+  INA_32V_2A,
+  INA_32V_1A,
+  INA_16V_400mA
 };
 static const InaRangePreset INA_PRESET = INA_32V_2A;
 
@@ -90,7 +91,6 @@ static const uint32_t OLED_PERIOD_MS = 250;
 Adafruit_INA219 ina219;
 
 volatile bool rxFlag = false;
-String rxdata;
 
 long txCounter = 0;
 uint32_t last_tx_ms = 0;
@@ -111,7 +111,7 @@ static double mAh_out = 0.0;
 static double mAh_in = 0.0;
 static double net_Wh = 0.0;
 
-// RX stats
+// Latest RX stats at BEACON (for whatever it last received)
 static float lastRSSI = NAN;
 static float lastSNR = NAN;
 static uint32_t last_rx_ms = 0;
@@ -119,68 +119,97 @@ static uint32_t last_rx_ms = 0;
 // OLED tick
 static uint32_t last_oled_ms = 0;
 
-// -------------------- Telemetry packet --------------------
-//
-// Little-endian packed struct, 40 bytes total.
-// Scaling:
-//  - lat/lon: int32 = degrees * 1e7
-//  - alt_dm:  int16 = meters * 10 (decimeters)
-//  - hdop_c:  uint16 = HDOP * 100 (centi-HDOP)
-//  - current_mA: int16 signed milliamps
-//  - v_mV: uint16 millivolts
-//  - net_mAh_x1000: int32 mAh * 1000
-//  - in/out_mAh_x1000: uint32 mAh * 1000
-//
-enum GpsQuality : uint8_t
-{
-    GPS_NOFIX = 0,
-    GPS_POOR = 1,
-    GPS_NORMAL = 2,
-    GPS_EXCELLENT = 3
-};
+// Track last TX packet so we can correlate ACKs
+static uint16_t last_tx_seq = 0;
+static uint32_t last_tx_start_ms = 0;
 
+// -------------------- CRC16 --------------------
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc = 0xFFFF)
 {
-    for (size_t i = 0; i < len; i++)
+  for (size_t i = 0; i < len; i++)
+  {
+    crc ^= (uint16_t)data[i] << 8;
+    for (int b = 0; b < 8; b++)
     {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int b = 0; b < 8; b++)
-        {
-            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
-        }
+      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
     }
-    return crc;
+  }
+  return crc;
 }
+
+// -------------------- Telemetry packet --------------------
+enum GpsQuality : uint8_t
+{
+  GPS_NOFIX = 0,
+  GPS_POOR = 1,
+  GPS_NORMAL = 2,
+  GPS_EXCELLENT = 3
+};
 
 struct __attribute__((packed)) TelemetryPacket
 {
-    uint32_t magic;    // 'TLMS' = 0x534D4C54 (little-endian)
-    uint8_t version;   // 1
-    uint8_t flags;     // bit0: has_fix, bit1: avg_used, bit2: charging
-    uint16_t seq;      // txCounter mod 65536
-    uint32_t uptime_s; // millis()/1000
+  uint32_t magic;    // 'TLMS' = 0x534D4C54 (little-endian)
+  uint8_t version;   // 1
+  uint8_t flags;     // bit0: has_fix, bit1: avg_used, bit2: charging
+  uint16_t seq;      // txCounter mod 65536
+  uint32_t uptime_s; // millis()/1000
 
-    int32_t lat_e7;      // deg * 1e7
-    int32_t lon_e7;      // deg * 1e7
-    int16_t alt_dm;      // meters * 10
-    uint16_t hdop_c;     // hdop * 100
-    uint8_t sats;        // satellites used
-    uint8_t gps_quality; // enum above
+  int32_t lat_e7;      // deg * 1e7
+  int32_t lon_e7;      // deg * 1e7
+  int16_t alt_dm;      // meters * 10
+  uint16_t hdop_c;     // hdop * 100
+  uint8_t sats;        // satellites used
+  uint8_t gps_quality; // enum above
 
-    int16_t current_mA; // signed
-    uint16_t v_mV;      // loadV * 1000
+  int16_t current_mA; // signed
+  uint16_t v_mV;      // loadV * 1000
 
-    int32_t net_mAh_x1000;  // net mAh * 1000
-    uint32_t in_mAh_x1000;  // in mAh * 1000
-    uint32_t out_mAh_x1000; // out mAh * 1000
+  int32_t net_mAh_x1000;  // net mAh * 1000
+  uint32_t in_mAh_x1000;  // in mAh * 1000
+  uint32_t out_mAh_x1000; // out mAh * 1000
 
-    int16_t rssi_dBm_x1; // last RX RSSI (if recent) else 0x7FFF
-    int16_t snr_dB_x10;  // last RX SNR * 10 (if recent) else 0x7FFF
+  int16_t rssi_dBm_x1; // last RX RSSI (if recent) else 0x7FFF
+  int16_t snr_dB_x10;  // last RX SNR * 10 (if recent) else 0x7FFF
 
-    uint16_t crc; // CRC16-CCITT of all prior bytes
+  uint16_t crc; // CRC16-CCITT of all prior bytes
 };
 
 static const uint32_t TLMS_MAGIC = 0x534D4C54; // 'TLMS'
+
+// -------------------- ACK packet (PONG) --------------------
+struct __attribute__((packed)) AckPacket
+{
+  uint32_t magic;  // 'ACK1' = 0x314B4341 (little-endian)
+  uint8_t version; // 1
+  uint8_t flags;   // reserved
+  uint16_t seq;    // echoed TelemetryPacket.seq
+
+  uint32_t rx_uptime_s; // receiver uptime when ACK built
+
+  int16_t ping_rssi_dBm_x1; // RSSI seen by receiver on PING
+  int16_t ping_snr_dB_x10;  // SNR*10 seen by receiver on PING
+  int32_t ping_freqerr_Hz;  // frequency error seen by receiver on PING (if available), else 0x7FFFFFFF
+  uint16_t ping_len;        // length of received PING in bytes (expected 40)
+
+  uint16_t crc; // CRC16-CCITT of all prior bytes
+};
+
+static const uint32_t ACK_MAGIC = 0x314B4341; // 'ACK1'
+
+static bool decodeAck(const uint8_t *buf, size_t len, AckPacket &out)
+{
+  if (len != sizeof(AckPacket))
+    return false;
+  memcpy(&out, buf, sizeof(out));
+  if (out.magic != ACK_MAGIC)
+    return false;
+
+  uint16_t got = out.crc;
+  AckPacket tmp = out;
+  tmp.crc = 0;
+  uint16_t calc = crc16_ccitt((const uint8_t *)&tmp, sizeof(tmp) - sizeof(tmp.crc));
+  return got == calc;
+}
 
 // -------------------- ISR --------------------
 void rx() { rxFlag = true; }
@@ -188,513 +217,542 @@ void rx() { rxFlag = true; }
 // -------------------- INA helpers --------------------
 static void initINA219()
 {
-    Wire1.begin(INA_SDA_PIN, INA_SCL_PIN);
+  Wire1.begin(INA_SDA_PIN, INA_SCL_PIN);
 
-    if (!ina219.begin(&Wire1))
-    {
-        Serial.println("INA219 not found (Wire1). Check wiring/address.");
-        return;
-    }
+  if (!ina219.begin(&Wire1))
+  {
+    Serial.println("INA219 not found (Wire1). Check wiring/address.");
+    return;
+  }
 
-    switch (INA_PRESET)
-    {
-    case INA_16V_400mA:
-        ina219.setCalibration_16V_400mA();
-        break;
-    case INA_32V_1A:
-        ina219.setCalibration_32V_1A();
-        break;
-    case INA_32V_2A:
-    default:
-        ina219.setCalibration_32V_2A();
-        break;
-    }
+  switch (INA_PRESET)
+  {
+  case INA_16V_400mA:
+    ina219.setCalibration_16V_400mA();
+    break;
+  case INA_32V_1A:
+    ina219.setCalibration_32V_1A();
+    break;
+  case INA_32V_2A:
+  default:
+    ina219.setCalibration_32V_2A();
+    break;
+  }
 
-    last_ina_sample_ms = millis();
+  last_ina_sample_ms = millis();
 }
 
 static void sampleAndIntegrateINA219()
 {
-    uint32_t now = millis();
-    uint32_t dt_ms = now - last_ina_sample_ms;
-    if (dt_ms < INA_SAMPLE_PERIOD_MS)
-        return;
-    last_ina_sample_ms = now;
+  uint32_t now = millis();
+  uint32_t dt_ms = now - last_ina_sample_ms;
+  if (dt_ms < INA_SAMPLE_PERIOD_MS)
+    return;
+  last_ina_sample_ms = now;
 
-    shunt_mV = ina219.getShuntVoltage_mV();
-    busV = ina219.getBusVoltage_V();
-    loadV = busV + (shunt_mV / 1000.0f);
+  shunt_mV = ina219.getShuntVoltage_mV();
+  busV = ina219.getBusVoltage_V();
+  loadV = busV + (shunt_mV / 1000.0f);
 
-    current_mA_raw = ina219.getCurrent_mA(); // signed
+  current_mA_raw = ina219.getCurrent_mA(); // signed
 
-    if (fabsf(current_mA_raw) < ZERO_DEADBAND_mA)
-        current_mA_raw = 0.0f;
+  if (fabsf(current_mA_raw) < ZERO_DEADBAND_mA)
+    current_mA_raw = 0.0f;
 
-    if (isnan(current_mA_filt))
-        current_mA_filt = current_mA_raw;
-    current_mA_filt = (CURRENT_EMA_ALPHA * current_mA_raw) + ((1.0f - CURRENT_EMA_ALPHA) * current_mA_filt);
+  if (isnan(current_mA_filt))
+    current_mA_filt = current_mA_raw;
+  current_mA_filt = (CURRENT_EMA_ALPHA * current_mA_raw) + ((1.0f - CURRENT_EMA_ALPHA) * current_mA_filt);
 
-    const double dt_hours = (double)dt_ms / 3600000.0;
+  const double dt_hours = (double)dt_ms / 3600000.0;
 
-    net_mAh += (double)current_mA_filt * dt_hours;
-    if (current_mA_filt >= 0.0f)
-        mAh_out += (double)current_mA_filt * dt_hours;
-    else
-        mAh_in += (double)(-current_mA_filt) * dt_hours;
+  net_mAh += (double)current_mA_filt * dt_hours;
+  if (current_mA_filt >= 0.0f)
+    mAh_out += (double)current_mA_filt * dt_hours;
+  else
+    mAh_in += (double)(-current_mA_filt) * dt_hours;
 
-    const double watts = ((double)loadV * (double)current_mA_filt) / 1000.0; // signed
-    net_Wh += watts * dt_hours;
+  const double watts = ((double)loadV * (double)current_mA_filt) / 1000.0; // signed
+  net_Wh += watts * dt_hours;
 }
 
 static const char *powerStateLabel()
 {
-    if (fabsf(current_mA_filt) < 1.0f)
-        return "IDLE";
-    if (current_mA_filt < 0.0f)
-        return "CHG";
-    return "DIS";
+  if (fabsf(current_mA_filt) < 1.0f)
+    return "IDLE";
+  if (current_mA_filt < 0.0f)
+    return "CHG";
+  return "DIS";
 }
 
 // -------------------- GPS helpers --------------------
-static GpsQuality gpsQualityNow()
-{
-    if (!gps_has_fix)
-        return GPS_NOFIX;
-    if ((millis() - gps_last_fix_ms) > GPS_FIX_STALE_MS)
-        return GPS_NOFIX;
-
-    if (isnan(gps_hdop) || gps_sats == 0)
-        return GPS_POOR;
-
-    if (gps_sats >= GPS_SATS_EXCELLENT && gps_hdop <= GPS_HDOP_EXCELLENT)
-        return GPS_EXCELLENT;
-    if (gps_sats >= GPS_SATS_NORMAL && gps_hdop <= GPS_HDOP_NORMAL)
-        return GPS_NORMAL;
-    return GPS_POOR;
-}
-
 static const char *gpsQualityLabel(GpsQuality q)
 {
-    switch (q)
-    {
-    case GPS_EXCELLENT:
-        return "EXCELLENT";
-    case GPS_NORMAL:
-        return "NORMAL";
-    case GPS_POOR:
-        return "POOR";
-    case GPS_NOFIX:
-    default:
-        return "NOFIX";
-    }
+  switch (q)
+  {
+  case GPS_EXCELLENT:
+    return "EXCELLENT";
+  case GPS_NORMAL:
+    return "NORMAL";
+  case GPS_POOR:
+    return "POOR";
+  case GPS_NOFIX:
+  default:
+    return "NOFIX";
+  }
+}
+
+static GpsQuality gpsQualityNow()
+{
+  if (!gps_has_fix)
+    return GPS_NOFIX;
+  if ((millis() - gps_last_fix_ms) > GPS_FIX_STALE_MS)
+    return GPS_NOFIX;
+
+  if (isnan(gps_hdop) || gps_sats == 0)
+    return GPS_POOR;
+
+  if (gps_sats >= GPS_SATS_EXCELLENT && gps_hdop <= GPS_HDOP_EXCELLENT)
+    return GPS_EXCELLENT;
+  if (gps_sats >= GPS_SATS_NORMAL && gps_hdop <= GPS_HDOP_NORMAL)
+    return GPS_NORMAL;
+  return GPS_POOR;
 }
 
 static void gpsInit()
 {
-    GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    Serial.printf("GPS init: UART1 %lu baud (RX=%d TX=%d)\n",
-                  (unsigned long)GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN);
-    gps_window_start_ms = millis();
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.printf("GPS init: UART1 %lu baud (RX=%d TX=%d)\n",
+                (unsigned long)GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN);
+  gps_window_start_ms = millis();
 }
 
 static void gpsResetAverager()
 {
-    gps_wsum = 0.0;
-    gps_lat_wsum = 0.0;
-    gps_lon_wsum = 0.0;
-    gps_alt_wsum = 0.0;
-    gps_hdop_wsum = 0.0;
-    gps_accum_samples = 0;
-    gps_window_start_ms = millis();
+  gps_wsum = 0.0;
+  gps_lat_wsum = 0.0;
+  gps_lon_wsum = 0.0;
+  gps_alt_wsum = 0.0;
+  gps_hdop_wsum = 0.0;
+  gps_accum_samples = 0;
+  gps_window_start_ms = millis();
 }
 
 static void gpsMaybeFinalizeAverage()
 {
-    uint32_t now = millis();
-    if ((now - gps_window_start_ms) < GPS_AVG_WINDOW_MS)
-        return;
+  uint32_t now = millis();
+  if ((now - gps_window_start_ms) < GPS_AVG_WINDOW_MS)
+    return;
 
-    if (gps_accum_samples >= GPS_AVG_MIN_SAMPLES && gps_wsum > 0.0)
-    {
-        gps_lat_avg = (float)(gps_lat_wsum / gps_wsum);
-        gps_lon_avg = (float)(gps_lon_wsum / gps_wsum);
-        gps_alt_avg_m = (float)(gps_alt_wsum / gps_wsum);
-        gps_hdop_avg = (float)(gps_hdop_wsum / gps_wsum);
-        gps_avg_samples = gps_accum_samples;
-        gps_last_avg_ms = now;
-        gps_has_avg = true;
-    }
+  if (gps_accum_samples >= GPS_AVG_MIN_SAMPLES && gps_wsum > 0.0)
+  {
+    gps_lat_avg = (float)(gps_lat_wsum / gps_wsum);
+    gps_lon_avg = (float)(gps_lon_wsum / gps_wsum);
+    gps_alt_avg_m = (float)(gps_alt_wsum / gps_wsum);
+    gps_hdop_avg = (float)(gps_hdop_wsum / gps_wsum);
+    gps_avg_samples = gps_accum_samples;
+    gps_last_avg_ms = now;
+    gps_has_avg = true;
+  }
 
-    gpsResetAverager();
+  gpsResetAverager();
 }
 
 static void gpsPoll()
 {
-    while (GPSSerial.available() > 0)
-        gps.encode((char)GPSSerial.read());
+  while (GPSSerial.available() > 0)
+    gps.encode((char)GPSSerial.read());
 
-    if (gps.location.isValid())
-    {
-        gps_lat = (float)gps.location.lat();
-        gps_lon = (float)gps.location.lng();
-        gps_has_fix = true;
-        gps_last_fix_ms = millis();
-    }
-    if (gps.altitude.isValid())
-        gps_alt_m = (float)gps.altitude.meters();
-    if (gps.hdop.isValid())
-        gps_hdop = (float)gps.hdop.hdop();
-    if (gps.satellites.isValid())
-        gps_sats = (uint32_t)gps.satellites.value();
+  if (gps.location.isValid())
+  {
+    gps_lat = (float)gps.location.lat();
+    gps_lon = (float)gps.location.lng();
+    gps_has_fix = true;
+    gps_last_fix_ms = millis();
+  }
+  if (gps.altitude.isValid())
+    gps_alt_m = (float)gps.altitude.meters();
+  if (gps.hdop.isValid())
+    gps_hdop = (float)gps.hdop.hdop();
+  if (gps.satellites.isValid())
+    gps_sats = (uint32_t)gps.satellites.value();
 
-    GpsQuality q = gpsQualityNow();
-    if ((q == GPS_NORMAL || q == GPS_EXCELLENT) && !isnan(gps_hdop) && gps_hdop > 0.0f)
-    {
-        const double hd = (double)max(0.6f, gps_hdop);
-        const double w = 1.0 / (hd * hd);
+  GpsQuality q = gpsQualityNow();
+  if ((q == GPS_NORMAL || q == GPS_EXCELLENT) && !isnan(gps_hdop) && gps_hdop > 0.0f)
+  {
+    const double hd = (double)max(0.6f, gps_hdop);
+    const double w = 1.0 / (hd * hd);
 
-        gps_wsum += w;
-        gps_lat_wsum += (double)gps_lat * w;
-        gps_lon_wsum += (double)gps_lon * w;
-        if (!isnan(gps_alt_m))
-            gps_alt_wsum += (double)gps_alt_m * w;
-        if (!isnan(gps_hdop))
-            gps_hdop_wsum += (double)gps_hdop * w;
+    gps_wsum += w;
+    gps_lat_wsum += (double)gps_lat * w;
+    gps_lon_wsum += (double)gps_lon * w;
+    if (!isnan(gps_alt_m))
+      gps_alt_wsum += (double)gps_alt_m * w;
+    if (!isnan(gps_hdop))
+      gps_hdop_wsum += (double)gps_hdop * w;
 
-        gps_accum_samples++;
-    }
+    gps_accum_samples++;
+  }
 
-    gpsMaybeFinalizeAverage();
+  gpsMaybeFinalizeAverage();
 }
 
 static void gpsDumpToSerialTick()
 {
-    uint32_t now = millis();
-    if (now - last_gps_print_ms < GPS_PRINT_PERIOD_MS)
-        return;
-    last_gps_print_ms = now;
+  uint32_t now = millis();
+  if (now - last_gps_print_ms < GPS_PRINT_PERIOD_MS)
+    return;
+  last_gps_print_ms = now;
 
-    GpsQuality q = gpsQualityNow();
-    Serial.printf("[GPS] q=%s sats=%lu hdop=%s alt=%s lat=%s lon=%s\n",
-                  gpsQualityLabel(q),
-                  (unsigned long)gps_sats,
-                  isnan(gps_hdop) ? "INV" : String(gps_hdop, 2).c_str(),
-                  isnan(gps_alt_m) ? "INV" : String(gps_alt_m, 1).c_str(),
-                  gps_has_fix ? String(gps_lat, 5).c_str() : "INV",
-                  gps_has_fix ? String(gps_lon, 5).c_str() : "INV");
-
-    if (gps_has_avg)
-    {
-        Serial.printf("[GPS-AVG] samples=%lu age=%lums lat=%.5f lon=%.5f alt=%.1f hdop=%.2f\n",
-                      (unsigned long)gps_avg_samples,
-                      (unsigned long)(now - gps_last_avg_ms),
-                      gps_lat_avg, gps_lon_avg, gps_alt_avg_m, gps_hdop_avg);
-    }
+  GpsQuality q = gpsQualityNow();
+  Serial.printf("[GPS] q=%s sats=%lu hdop=%s alt=%s lat=%s lon=%s\n",
+                gpsQualityLabel(q),
+                (unsigned long)gps_sats,
+                isnan(gps_hdop) ? "INV" : String(gps_hdop, 2).c_str(),
+                isnan(gps_alt_m) ? "INV" : String(gps_alt_m, 1).c_str(),
+                gps_has_fix ? String(gps_lat, 5).c_str() : "INV",
+                gps_has_fix ? String(gps_lon, 5).c_str() : "INV");
 }
 
 // -------------------- OLED helpers --------------------
 static void drawStatusOLED()
 {
-    display.clear();
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.setFont(ArialMT_Plain_10);
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
 
-    GpsQuality q = gpsQualityNow();
+  GpsQuality q = gpsQualityNow();
 
-    display.drawString(0, 0, "Heltec V3  GPS");
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(128, 0, gpsQualityLabel(q));
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.drawString(0, 0, "Heltec V3  GPS");
+  display.setTextAlignment(TEXT_ALIGN_RIGHT);
+  display.drawString(128, 0, gpsQualityLabel(q));
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-    bool avg_fresh = gps_has_avg && ((millis() - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
-    float showLat = avg_fresh ? gps_lat_avg : gps_lat;
-    float showLon = avg_fresh ? gps_lon_avg : gps_lon;
+  bool avg_fresh = gps_has_avg && ((millis() - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
+  float showLat = avg_fresh ? gps_lat_avg : gps_lat;
+  float showLon = avg_fresh ? gps_lon_avg : gps_lon;
 
-    String latStr = (gps_has_fix || avg_fresh) ? String(showLat, 5) : String("-----.-----");
-    String lonStr = (gps_has_fix || avg_fresh) ? String(showLon, 5) : String("-----.-----");
+  String latStr = (gps_has_fix || avg_fresh) ? String(showLat, 5) : String("-----.-----");
+  String lonStr = (gps_has_fix || avg_fresh) ? String(showLon, 5) : String("-----.-----");
 
-    display.drawString(0, 12, "Lat: " + latStr);
-    display.drawString(0, 24, "Lon: " + lonStr);
+  display.drawString(0, 12, "Lat: " + latStr);
+  display.drawString(0, 24, "Lon: " + lonStr);
 
-    float showAlt = avg_fresh ? gps_alt_avg_m : gps_alt_m;
-    float showHdop = avg_fresh ? gps_hdop_avg : gps_hdop;
+  float showAlt = avg_fresh ? gps_alt_avg_m : gps_alt_m;
+  float showHdop = avg_fresh ? gps_hdop_avg : gps_hdop;
 
-    String altStr = (!isnan(showAlt)) ? (String(showAlt, 0) + "m") : String("--m");
-    String hdopStr = (!isnan(showHdop)) ? String(showHdop, 2) : String("--");
-    String satsStr = (gps_sats > 0) ? String(gps_sats) : String("--");
+  String altStr = (!isnan(showAlt)) ? (String(showAlt, 0) + "m") : String("--m");
+  String hdopStr = (!isnan(showHdop)) ? String(showHdop, 2) : String("--");
+  String satsStr = (gps_sats > 0) ? String(gps_sats) : String("--");
 
-    display.drawString(0, 36, "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr);
+  display.drawString(0, 36, "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr);
 
-    String iStr = "I:" + String(current_mA_filt, 0) + "mA V:" + String(loadV, 2) + "V";
-    display.drawString(0, 48, iStr);
+  String iStr = "I:" + String(current_mA_filt, 0) + "mA V:" + String(loadV, 2) + "V";
+  display.drawString(0, 48, iStr);
 
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(128, 48, powerStateLabel());
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setTextAlignment(TEXT_ALIGN_RIGHT);
+  display.drawString(128, 48, powerStateLabel());
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-    if (!isnan(lastRSSI) && (millis() - last_rx_ms) < 10000)
-    {
-        display.drawString(0, 56, "RX R:" + String(lastRSSI, 0) + " S:" + String(lastSNR, 1));
-    }
-    else
-    {
-        display.drawString(0, 56, "TX#" + String(txCounter) + " " + String(millis() / 1000) + "s");
-    }
+  if (!isnan(lastRSSI) && (millis() - last_rx_ms) < 10000)
+    display.drawString(0, 56, "RX R:" + String(lastRSSI, 0) + " S:" + String(lastSNR, 1));
+  else
+    display.drawString(0, 56, "TX#" + String(txCounter) + " " + String(millis() / 1000) + "s");
 
-    display.display();
+  display.display();
 }
 
 static void oledTick()
 {
-    uint32_t now = millis();
-    if (now - last_oled_ms < OLED_PERIOD_MS)
-        return;
-    last_oled_ms = now;
-    drawStatusOLED();
+  uint32_t now = millis();
+  if (now - last_oled_ms < OLED_PERIOD_MS)
+    return;
+  last_oled_ms = now;
+  drawStatusOLED();
 }
 
 // -------------------- Radio helpers --------------------
 static void radioInit()
 {
-    Serial.println("Radio init...");
-    RADIOLIB_OR_HALT(radio.begin());
+  Serial.println("Radio init...");
+  RADIOLIB_OR_HALT(radio.begin());
 
-    radio.setDio1Action(rx);
+  radio.setDio1Action(rx);
 
-    RADIOLIB_OR_HALT(radio.setFrequency(FREQUENCY));
-    RADIOLIB_OR_HALT(radio.setBandwidth(BANDWIDTH));
-    RADIOLIB_OR_HALT(radio.setSpreadingFactor(SPREADING_FACTOR));
-    RADIOLIB_OR_HALT(radio.setOutputPower(TRANSMIT_POWER));
+  RADIOLIB_OR_HALT(radio.setFrequency(FREQUENCY));
+  RADIOLIB_OR_HALT(radio.setBandwidth(BANDWIDTH));
+  RADIOLIB_OR_HALT(radio.setSpreadingFactor(SPREADING_FACTOR));
+  RADIOLIB_OR_HALT(radio.setOutputPower(TRANSMIT_POWER));
 
-    RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
+  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
 }
 
 static void buildTelemetryPacket(TelemetryPacket &p)
 {
-    memset(&p, 0, sizeof(p));
-    p.magic = TLMS_MAGIC;
-    p.version = 1;
+  memset(&p, 0, sizeof(p));
+  p.magic = TLMS_MAGIC;
+  p.version = 1;
 
-    const uint32_t now = millis();
-    p.uptime_s = now / 1000;
-    p.seq = (uint16_t)(txCounter & 0xFFFF);
+  const uint32_t now = millis();
+  p.uptime_s = now / 1000;
+  p.seq = (uint16_t)(txCounter & 0xFFFF);
 
-    // Choose averaged GPS if fresh, else raw
-    bool avg_fresh = gps_has_avg && ((now - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
-    bool has_fix_fresh = gps_has_fix && ((now - gps_last_fix_ms) <= GPS_FIX_STALE_MS);
+  bool avg_fresh = gps_has_avg && ((now - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
+  bool has_fix_fresh = gps_has_fix && ((now - gps_last_fix_ms) <= GPS_FIX_STALE_MS);
 
-    float lat = avg_fresh ? gps_lat_avg : gps_lat;
-    float lon = avg_fresh ? gps_lon_avg : gps_lon;
-    float altm = avg_fresh ? gps_alt_avg_m : gps_alt_m;
-    float hdop = avg_fresh ? gps_hdop_avg : gps_hdop;
+  float lat = avg_fresh ? gps_lat_avg : gps_lat;
+  float lon = avg_fresh ? gps_lon_avg : gps_lon;
+  float altm = avg_fresh ? gps_alt_avg_m : gps_alt_m;
+  float hdop = avg_fresh ? gps_hdop_avg : gps_hdop;
 
-    if (has_fix_fresh || avg_fresh)
-        p.flags |= (1u << 0);
-    if (avg_fresh)
-        p.flags |= (1u << 1);
-    if (current_mA_filt < -1.0f)
-        p.flags |= (1u << 2); // charging
+  if (has_fix_fresh || avg_fresh)
+    p.flags |= (1u << 0);
+  if (avg_fresh)
+    p.flags |= (1u << 1);
+  if (current_mA_filt < -1.0f)
+    p.flags |= (1u << 2);
 
-    GpsQuality q = gpsQualityNow();
-    p.gps_quality = (uint8_t)q;
+  p.gps_quality = (uint8_t)gpsQualityNow();
 
-    // Scaled fields (guard NaNs)
-    if (!isnan(lat) && !isnan(lon) && (has_fix_fresh || avg_fresh))
-    {
-        p.lat_e7 = (int32_t)llround((double)lat * 1e7);
-        p.lon_e7 = (int32_t)llround((double)lon * 1e7);
-    }
-    else
-    {
-        p.lat_e7 = 0;
-        p.lon_e7 = 0;
-    }
+  if (!isnan(lat) && !isnan(lon) && (has_fix_fresh || avg_fresh))
+  {
+    p.lat_e7 = (int32_t)llround((double)lat * 1e7);
+    p.lon_e7 = (int32_t)llround((double)lon * 1e7);
+  }
 
-    if (!isnan(altm))
-    {
-        double dm = (double)altm * 10.0;
-        if (dm > 32767)
-            dm = 32767;
-        if (dm < -32768)
-            dm = -32768;
-        p.alt_dm = (int16_t)llround(dm);
-    }
-    else
-    {
-        p.alt_dm = (int16_t)0x7FFF;
-    }
+  if (!isnan(altm))
+  {
+    double dm = (double)altm * 10.0;
+    if (dm > 32767)
+      dm = 32767;
+    if (dm < -32768)
+      dm = -32768;
+    p.alt_dm = (int16_t)llround(dm);
+  }
+  else
+  {
+    p.alt_dm = (int16_t)0x7FFF;
+  }
 
-    if (!isnan(hdop))
-    {
-        double hc = (double)hdop * 100.0;
-        if (hc < 0)
-            hc = 0;
-        if (hc > 65535)
-            hc = 65535;
-        p.hdop_c = (uint16_t)llround(hc);
-    }
-    else
-    {
-        p.hdop_c = 0xFFFF;
-    }
+  if (!isnan(hdop))
+  {
+    double hc = (double)hdop * 100.0;
+    if (hc < 0)
+      hc = 0;
+    if (hc > 65535)
+      hc = 65535;
+    p.hdop_c = (uint16_t)llround(hc);
+  }
+  else
+  {
+    p.hdop_c = 0xFFFF;
+  }
 
-    p.sats = (gps_sats > 255) ? 255 : (uint8_t)gps_sats;
+  p.sats = (gps_sats > 255) ? 255 : (uint8_t)gps_sats;
 
-    // Power
-    double imA = isnan(current_mA_filt) ? 0.0 : (double)current_mA_filt;
-    if (imA > 32767)
-        imA = 32767;
-    if (imA < -32768)
-        imA = -32768;
-    p.current_mA = (int16_t)llround(imA);
+  double imA = isnan(current_mA_filt) ? 0.0 : (double)current_mA_filt;
+  if (imA > 32767)
+    imA = 32767;
+  if (imA < -32768)
+    imA = -32768;
+  p.current_mA = (int16_t)llround(imA);
 
-    double vmV = (double)loadV * 1000.0;
-    if (vmV < 0)
-        vmV = 0;
-    if (vmV > 65535)
-        vmV = 65535;
-    p.v_mV = (uint16_t)llround(vmV);
+  double vmV = (double)loadV * 1000.0;
+  if (vmV < 0)
+    vmV = 0;
+  if (vmV > 65535)
+    vmV = 65535;
+  p.v_mV = (uint16_t)llround(vmV);
 
-    // mAh totals scaled by 1000
-    double net = net_mAh * 1000.0;
-    if (net > 2147483647.0)
-        net = 2147483647.0;
-    if (net < -2147483648.0)
-        net = -2147483648.0;
-    p.net_mAh_x1000 = (int32_t)llround(net);
+  double net = net_mAh * 1000.0;
+  if (net > 2147483647.0)
+    net = 2147483647.0;
+  if (net < -2147483648.0)
+    net = -2147483648.0;
+  p.net_mAh_x1000 = (int32_t)llround(net);
 
-    double inx = mAh_in * 1000.0;
-    double outx = mAh_out * 1000.0;
-    if (inx < 0)
-        inx = 0;
-    if (inx > 4294967295.0)
-        inx = 4294967295.0;
-    if (outx < 0)
-        outx = 0;
-    if (outx > 4294967295.0)
-        outx = 4294967295.0;
-    p.in_mAh_x1000 = (uint32_t)llround(inx);
-    p.out_mAh_x1000 = (uint32_t)llround(outx);
+  double inx = mAh_in * 1000.0;
+  double outx = mAh_out * 1000.0;
+  if (inx < 0)
+    inx = 0;
+  if (inx > 4294967295.0)
+    inx = 4294967295.0;
+  if (outx < 0)
+    outx = 0;
+  if (outx > 4294967295.0)
+    outx = 4294967295.0;
+  p.in_mAh_x1000 = (uint32_t)llround(inx);
+  p.out_mAh_x1000 = (uint32_t)llround(outx);
 
-    // RX stats packed (if recent)
-    if (!isnan(lastRSSI) && (now - last_rx_ms) < 10000)
-    {
-        double r = lastRSSI;
-        if (r > 32767)
-            r = 32767;
-        if (r < -32768)
-            r = -32768;
-        p.rssi_dBm_x1 = (int16_t)llround(r);
+  if (!isnan(lastRSSI) && (now - last_rx_ms) < 10000)
+  {
+    double r = lastRSSI;
+    if (r > 32767)
+      r = 32767;
+    if (r < -32768)
+      r = -32768;
+    p.rssi_dBm_x1 = (int16_t)llround(r);
 
-        double s10 = (double)lastSNR * 10.0;
-        if (s10 > 32767)
-            s10 = 32767;
-        if (s10 < -32768)
-            s10 = -32768;
-        p.snr_dB_x10 = (int16_t)llround(s10);
-    }
-    else
-    {
-        p.rssi_dBm_x1 = (int16_t)0x7FFF;
-        p.snr_dB_x10 = (int16_t)0x7FFF;
-    }
+    double s10 = (double)lastSNR * 10.0;
+    if (s10 > 32767)
+      s10 = 32767;
+    if (s10 < -32768)
+      s10 = -32768;
+    p.snr_dB_x10 = (int16_t)llround(s10);
+  }
+  else
+  {
+    p.rssi_dBm_x1 = (int16_t)0x7FFF;
+    p.snr_dB_x10 = (int16_t)0x7FFF;
+  }
 
-    // CRC over all bytes except crc field itself
-    p.crc = 0;
-    p.crc = crc16_ccitt((const uint8_t *)&p, sizeof(p) - sizeof(p.crc));
+  p.crc = 0;
+  p.crc = crc16_ccitt((const uint8_t *)&p, sizeof(p) - sizeof(p.crc));
 }
 
 static void handleTX()
 {
-    uint32_t now = millis();
+  uint32_t now = millis();
 
-    bool tx_legal = (now - last_tx_ms) >= minimum_pause_ms;
-    bool timeToTx = (PAUSE > 0) && (now - last_tx_ms) >= (uint32_t)PAUSE * 1000UL;
-    bool buttonTx = button.isSingleClick();
+  bool tx_legal = (now - last_tx_ms) >= minimum_pause_ms;
+  bool timeToTx = (PAUSE > 0) && (now - last_tx_ms) >= (uint32_t)PAUSE * 1000UL;
+  bool buttonTx = button.isSingleClick();
 
-    if (!(timeToTx || buttonTx))
-        return;
-    if (!tx_legal)
-        return;
+  if (!(timeToTx || buttonTx))
+    return;
+  if (!tx_legal)
+    return;
 
-    radio.clearDio1Action();
+  radio.clearDio1Action();
 
-    TelemetryPacket pkt;
-    buildTelemetryPacket(pkt);
+  TelemetryPacket pkt;
+  buildTelemetryPacket(pkt);
 
-    heltec_led(50);
-    tx_time_ms = millis();
-    RADIOLIB(radio.transmit((uint8_t *)&pkt, sizeof(pkt)));
-    tx_time_ms = millis() - tx_time_ms;
-    heltec_led(0);
+  heltec_led(50);
+  tx_time_ms = millis();
+  last_tx_start_ms = tx_time_ms;
+  RADIOLIB(radio.transmit((uint8_t *)&pkt, sizeof(pkt)));
+  tx_time_ms = millis() - tx_time_ms;
+  heltec_led(0);
 
-    if (_radiolib_status != RADIOLIB_ERR_NONE)
-    {
-        Serial.printf("TX fail: %d\n", _radiolib_status);
-    }
-    else
-    {
-        Serial.printf("TX tlm %u bytes seq=%u\n", (unsigned)sizeof(pkt), (unsigned)pkt.seq);
-    }
+  if (_radiolib_status != RADIOLIB_ERR_NONE)
+  {
+    Serial.printf("PING TX fail: %d\n", _radiolib_status);
+  }
+  else
+  {
+    Serial.printf("PING tx %u bytes seq=%u (air=%lums)\n",
+                  (unsigned)sizeof(pkt), (unsigned)pkt.seq, (unsigned long)tx_time_ms);
+    last_tx_seq = pkt.seq;
+  }
 
-    minimum_pause_ms = tx_time_ms * 2;
-    last_tx_ms = millis();
-    txCounter++;
+  minimum_pause_ms = tx_time_ms * 2;
+  last_tx_ms = millis();
+  txCounter++;
 
-    radio.setDio1Action(rx);
-    RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
+  radio.setDio1Action(rx);
+  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
+}
+
+static void logAckWithPingContext(const AckPacket &ack, float ack_rssi, float ack_snr)
+{
+  const uint32_t rtt_ms = (last_tx_start_ms > 0) ? (millis() - last_tx_start_ms) : 0;
+
+  const char *ping_fe = (ack.ping_freqerr_Hz == 0x7FFFFFFF) ? "INV" : String((long)ack.ping_freqerr_Hz).c_str();
+
+  Serial.printf(
+      "PONG seq=%u rtt=%lums | beaconTX{seq=%u} "
+      "| rxPing{R=%ddBm S=%.1fdB FE=%sHz len=%u rxUp=%lus} "
+      "| beaconRxAck{R=%.1fdBm S=%.1fdB}\n",
+      (unsigned)ack.seq,
+      (unsigned long)rtt_ms,
+      (unsigned)last_tx_seq,
+      (int)ack.ping_rssi_dBm_x1,
+      (double)ack.ping_snr_dB_x10 / 10.0,
+      ping_fe,
+      (unsigned)ack.ping_len,
+      (unsigned long)ack.rx_uptime_s,
+      ack_rssi, ack_snr);
 }
 
 static void handleRX()
 {
-    if (!rxFlag)
-        return;
-    rxFlag = false;
+  if (!rxFlag)
+    return;
+  rxFlag = false;
 
-    // Read raw RX into string for now (you can switch to binary decode later)
-    radio.readData(rxdata);
-    if (_radiolib_status == RADIOLIB_ERR_NONE)
-    {
-        lastRSSI = radio.getRSSI();
-        lastSNR = radio.getSNR();
-        last_rx_ms = millis();
-        Serial.printf("RX [%s] RSSI=%.1f SNR=%.1f\n", rxdata.c_str(), lastRSSI, lastSNR);
-    }
+  uint8_t buf[64] = {0};
+  int16_t len = radio.getPacketLength(true);
+  size_t toRead = (len > 0 && (size_t)len < sizeof(buf)) ? (size_t)len : sizeof(buf);
+  radio.readData(buf, toRead);
 
+  lastRSSI = radio.getRSSI();
+  lastSNR = radio.getSNR();
+  last_rx_ms = millis();
+
+  if (_radiolib_status != RADIOLIB_ERR_NONE)
+  {
+    Serial.printf("RX read fail: %d RSSI=%.1f SNR=%.1f len=%d\n", _radiolib_status, lastRSSI, lastSNR, (int)len);
     RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
+    return;
+  }
+
+  if ((size_t)len == sizeof(AckPacket))
+  {
+    AckPacket ack;
+    if (decodeAck(buf, sizeof(AckPacket), ack))
+    {
+      if (ack.seq == last_tx_seq)
+        logAckWithPingContext(ack, lastRSSI, lastSNR);
+      else
+        Serial.printf("PONG (out-of-order) seq=%u (expected %u) RSSI=%.1f SNR=%.1f\n",
+                      (unsigned)ack.seq, (unsigned)last_tx_seq, lastRSSI, lastSNR);
+    }
+    else
+    {
+      Serial.printf("RX invalid ACK (crc/magic) RSSI=%.1f SNR=%.1f\n", lastRSSI, lastSNR);
+    }
+  }
+  else
+  {
+    Serial.printf("RX unknown len=%d RSSI=%.1f SNR=%.1f\n", (int)len, lastRSSI, lastSNR);
+  }
+
+  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
 }
 
 // -------------------- Arduino entrypoints --------------------
 void setup()
 {
-    Serial.begin(115200);
+  Serial.begin(115200);
 
-    heltec_setup();
+  heltec_setup();
 
-    display.init();
-    display.setFont(ArialMT_Plain_10);
+  display.init();
+  display.setFont(ArialMT_Plain_10);
 
-    initINA219();
-    gpsInit();
-    gpsResetAverager();
-    radioInit();
+  initINA219();
+  gpsInit();
+  gpsResetAverager();
+  radioInit();
 
-    drawStatusOLED();
+  drawStatusOLED();
 
-    Serial.printf("TelemetryPacket size = %u bytes\n", (unsigned)sizeof(TelemetryPacket));
+  Serial.printf("TelemetryPacket size = %u bytes\n", (unsigned)sizeof(TelemetryPacket));
+  Serial.printf("AckPacket size       = %u bytes\n", (unsigned)sizeof(AckPacket));
 }
 
 void loop()
 {
-    heltec_loop();
+  heltec_loop();
 
-    sampleAndIntegrateINA219();
+  sampleAndIntegrateINA219();
 
-    gpsPoll();
-    gpsDumpToSerialTick();
+  gpsPoll();
+  gpsDumpToSerialTick();
 
-    handleTX();
-    handleRX();
+  handleTX();
+  handleRX();
 
-    oledTick();
+  oledTick();
 }
+

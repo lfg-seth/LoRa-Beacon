@@ -1,13 +1,13 @@
 /**
  * Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) - RECEIVER
- * - Raw LoRa RX (no LoRaWAN)
- * - Receives TelemetryPacket (binary, 40 bytes) + CRC16
- * - Logs every valid packet to Serial
- * - OLED shows a compact summary (GPS quality, sats/hdop, lat/lon, I/V, uptime)
+ * - Raw LoRa RX/TX (no LoRaWAN)
+ * - Receives TelemetryPacket (binary, 40 bytes) + CRC16 (PING)
+ * - Logs every packet with useful RF metrics (RSSI/SNR/FreqError/Len)
+ * - Each time a valid PING is received, immediately sends an AckPacket (PONG)
+ *   containing the receiver-measured RF metrics for that PING.
  *
- * Assumes the transmitter uses:
+ * Assumes the beacon uses:
  *   FREQUENCY 910.525 MHz, BW 125 kHz, SF9, PWR 10 dBm
- * and the exact TelemetryPacket definition below.
  */
 
 #define HELTEC_POWER_BUTTON
@@ -16,7 +16,7 @@
 
 #include <Arduino.h>
 
-// -------------------- Radio settings (MUST match TX) --------------------
+// -------------------- Radio settings (MUST match beacon) --------------------
 #define FREQUENCY 910.525 // MHz
 #define BANDWIDTH 125.0   // kHz
 #define SPREADING_FACTOR 9
@@ -30,11 +30,26 @@ uint32_t last_oled_ms = 0;
 
 static float rxRSSI = NAN;
 static float rxSNR = NAN;
+static int32_t rxFreqErrHz = 0x7FFFFFFF;
 static uint32_t last_rx_ms = 0;
 static uint32_t good_pkts = 0;
 static uint32_t bad_pkts = 0;
 
-// -------------------- Telemetry packet (MUST match TX) --------------------
+// -------------------- CRC16 --------------------
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc = 0xFFFF)
+{
+  for (size_t i = 0; i < len; i++)
+  {
+    crc ^= (uint16_t)data[i] << 8;
+    for (int b = 0; b < 8; b++)
+    {
+      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+    }
+  }
+  return crc;
+}
+
+// -------------------- Telemetry packet (MUST match beacon) --------------------
 enum GpsQuality : uint8_t
 {
   GPS_NOFIX = 0,
@@ -57,19 +72,6 @@ static const char *gpsQualityLabel(uint8_t q)
   default:
     return "NOFIX";
   }
-}
-
-static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc = 0xFFFF)
-{
-  for (size_t i = 0; i < len; i++)
-  {
-    crc ^= (uint16_t)data[i] << 8;
-    for (int b = 0; b < 8; b++)
-    {
-      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
-    }
-  }
-  return crc;
 }
 
 struct __attribute__((packed)) TelemetryPacket
@@ -117,6 +119,59 @@ static bool decodeTelemetry(const uint8_t *buf, size_t len, TelemetryPacket &out
   return got == calc;
 }
 
+// -------------------- ACK packet (PONG) --------------------
+struct __attribute__((packed)) AckPacket
+{
+  uint32_t magic;  // 'ACK1' = 0x314B4341 (little-endian)
+  uint8_t version; // 1
+  uint8_t flags;   // reserved
+  uint16_t seq;    // echoed TelemetryPacket.seq
+
+  uint32_t rx_uptime_s; // receiver uptime when ACK built
+
+  int16_t ping_rssi_dBm_x1; // RSSI seen on PING
+  int16_t ping_snr_dB_x10;  // SNR*10 seen on PING
+  int32_t ping_freqerr_Hz;  // freq error on PING (if available) else 0x7FFFFFFF
+  uint16_t ping_len;        // PING length in bytes (expected 40)
+
+  uint16_t crc; // CRC16-CCITT of all prior bytes
+};
+
+static const uint32_t ACK_MAGIC = 0x314B4341; // 'ACK1'
+
+static void buildAck(AckPacket &ack, uint16_t seq, uint16_t ping_len)
+{
+  memset(&ack, 0, sizeof(ack));
+  ack.magic = ACK_MAGIC;
+  ack.version = 1;
+  ack.seq = seq;
+  ack.rx_uptime_s = millis() / 1000;
+
+  // Receiver-measured metrics for the PING
+  const double r = isnan(rxRSSI) ? 0.0 : (double)rxRSSI;
+  const double s10 = isnan(rxSNR) ? 0.0 : ((double)rxSNR * 10.0);
+
+  double rclamp = r;
+  if (rclamp > 32767)
+    rclamp = 32767;
+  if (rclamp < -32768)
+    rclamp = -32768;
+  ack.ping_rssi_dBm_x1 = (int16_t)llround(rclamp);
+
+  double s10clamp = s10;
+  if (s10clamp > 32767)
+    s10clamp = 32767;
+  if (s10clamp < -32768)
+    s10clamp = -32768;
+  ack.ping_snr_dB_x10 = (int16_t)llround(s10clamp);
+
+  ack.ping_freqerr_Hz = rxFreqErrHz;
+  ack.ping_len = ping_len;
+
+  ack.crc = 0;
+  ack.crc = crc16_ccitt((const uint8_t *)&ack, sizeof(ack) - sizeof(ack.crc));
+}
+
 // Store last good packet for OLED
 static TelemetryPacket lastPkt;
 static bool hasPkt = false;
@@ -131,7 +186,7 @@ static void drawOLED()
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.setFont(ArialMT_Plain_10);
 
-  display.drawString(0, 0, "LoRa TLM RX");
+  display.drawString(0, 0, "LoRa PING/PONG RX");
 
   // Top-right: link stats
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
@@ -151,7 +206,6 @@ static void drawOLED()
   const double lon = (double)lastPkt.lon_e7 / 1e7;
   const double alt_m = (lastPkt.alt_dm == (int16_t)0x7FFF) ? NAN : ((double)lastPkt.alt_dm / 10.0);
   const double hdop = (lastPkt.hdop_c == 0xFFFF) ? NAN : ((double)lastPkt.hdop_c / 100.0);
-  const double volts = (double)lastPkt.v_mV / 1000.0;
   const int cur_mA = (int)lastPkt.current_mA;
 
   const bool hasFix = (lastPkt.flags & (1u << 0)) != 0;
@@ -176,10 +230,12 @@ static void drawOLED()
   String l5 = "Alt:" + altStr + " I:" + String(cur_mA) + "mA";
   display.drawString(0, 48, l5);
 
-  // Line 6: V + seq + RSSI
-  String l6 = "V:" + String(volts, 2) + " Seq:" + String(lastPkt.seq);
+  // Line 6: RSSI/SNR + seq
+  String l6 = "Seq:" + String(lastPkt.seq);
   if (!isnan(rxRSSI))
     l6 += " R:" + String(rxRSSI, 0);
+  if (!isnan(rxSNR))
+    l6 += " S:" + String(rxSNR, 1);
   display.drawString(0, 56, l6);
 
   display.display();
@@ -209,7 +265,18 @@ static void radioInit()
   RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
 }
 
-static void logPacketToSerial(const TelemetryPacket &p)
+static int32_t tryGetFreqErrHz()
+{
+  // Not all RadioLib builds expose this per radio.
+  // If unavailable, return sentinel 0x7FFFFFFF.
+  int32_t fe = 0x7FFFFFFF;
+#if defined(RADIOLIB_VERSION)
+  fe = (int32_t)radio.getFrequencyError();
+#endif
+  return fe;
+}
+
+static void logPacketToSerial(const TelemetryPacket &p, uint16_t got_len)
 {
   const double lat = (double)p.lat_e7 / 1e7;
   const double lon = (double)p.lon_e7 / 1e7;
@@ -227,10 +294,12 @@ static void logPacketToSerial(const TelemetryPacket &p)
   const bool avgUsed = (p.flags & (1u << 1)) != 0;
   const bool charging = (p.flags & (1u << 2)) != 0;
 
+  const char *feStr = (rxFreqErrHz == 0x7FFFFFFF) ? "INV" : String((long)rxFreqErrHz).c_str();
+
   Serial.printf(
-      "TLM v%u seq=%u up=%lus flags{fix=%u avg=%u chg=%u} gps{%s sats=%u hdop=%s alt=%s lat=%s lon=%s} "
+      "PING v%u seq=%u up=%lus flags{fix=%u avg=%u chg=%u} gps{%s sats=%u hdop=%s alt=%s lat=%s lon=%s} "
       "pwr{I=%dmA V=%.3f} mAh{net=%.3f in=%.3f out=%.3f} "
-      "rx{R=%.1f S=%.1f} tx_rx{R=%s S=%s}\n",
+      "rf{len=%u R=%.1f S=%.1f FE=%sHz}\n",
       (unsigned)p.version,
       (unsigned)p.seq,
       (unsigned long)p.uptime_s,
@@ -243,9 +312,31 @@ static void logPacketToSerial(const TelemetryPacket &p)
       hasFix ? String(lon, 5).c_str() : "INV",
       cur_mA, volts,
       net_mAh, in_mAh, out_mAh,
-      rxRSSI, rxSNR,
-      (p.rssi_dBm_x1 == (int16_t)0x7FFF) ? "INV" : String((int)p.rssi_dBm_x1).c_str(),
-      (p.snr_dB_x10 == (int16_t)0x7FFF) ? "INV" : String((double)p.snr_dB_x10 / 10.0, 1).c_str());
+      (unsigned)got_len, rxRSSI, rxSNR, feStr);
+}
+
+static void sendAck(uint16_t seq, uint16_t ping_len)
+{
+  AckPacket ack;
+  buildAck(ack, seq, ping_len);
+
+  radio.clearDio1Action();
+
+  uint32_t t0 = millis();
+  RADIOLIB(radio.transmit((uint8_t *)&ack, sizeof(ack)));
+  uint32_t dt = millis() - t0;
+
+  if (_radiolib_status != RADIOLIB_ERR_NONE)
+  {
+    Serial.printf("PONG TX fail: %d\n", _radiolib_status);
+  }
+  else
+  {
+    Serial.printf("PONG tx %u bytes seq=%u (air=%lums)\n", (unsigned)sizeof(ack), (unsigned)seq, (unsigned long)dt);
+  }
+
+  radio.setDio1Action(rx);
+  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
 }
 
 static void handleRX()
@@ -257,35 +348,28 @@ static void handleRX()
   uint8_t buf[sizeof(TelemetryPacket)] = {0};
   int16_t len = radio.getPacketLength(true);
 
-  // If length doesn't match, drain into buffer up to our size anyway
-  if (len != (int16_t)sizeof(TelemetryPacket))
-  {
-    // Read raw bytes (RadioLib will read up to provided length)
-    size_t toRead = (len > 0 && (size_t)len < sizeof(buf)) ? (size_t)len : sizeof(buf);
-    radio.readData(buf, toRead);
+  size_t toRead = (len > 0 && (size_t)len <= sizeof(buf)) ? (size_t)len : sizeof(buf);
+  radio.readData(buf, toRead);
 
-    rxRSSI = radio.getRSSI();
-    rxSNR = radio.getSNR();
-    last_rx_ms = millis();
-
-    bad_pkts++;
-    Serial.printf("RX len mismatch: got=%d expected=%u RSSI=%.1f SNR=%.1f\n",
-                  (int)len, (unsigned)sizeof(TelemetryPacket), rxRSSI, rxSNR);
-
-    RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
-    return;
-  }
-
-  // Read full packet
-  radio.readData(buf, sizeof(buf));
   rxRSSI = radio.getRSSI();
   rxSNR = radio.getSNR();
+  rxFreqErrHz = tryGetFreqErrHz();
   last_rx_ms = millis();
 
   if (_radiolib_status != RADIOLIB_ERR_NONE)
   {
     bad_pkts++;
-    Serial.printf("RX read fail: %d RSSI=%.1f SNR=%.1f\n", _radiolib_status, rxRSSI, rxSNR);
+    Serial.printf("RX read fail: %d RSSI=%.1f SNR=%.1f len=%d\n", _radiolib_status, rxRSSI, rxSNR, (int)len);
+    RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
+    return;
+  }
+
+  if (len != (int16_t)sizeof(TelemetryPacket))
+  {
+    bad_pkts++;
+    Serial.printf("RX len mismatch: got=%d expected=%u RSSI=%.1f SNR=%.1f\n",
+                  (int)len, (unsigned)sizeof(TelemetryPacket), rxRSSI, rxSNR);
+
     RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
     return;
   }
@@ -303,9 +387,10 @@ static void handleRX()
   lastPkt = pkt;
   hasPkt = true;
 
-  logPacketToSerial(pkt);
+  logPacketToSerial(pkt, (uint16_t)len);
 
-  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
+  // Immediately reply with PONG containing the RF metrics we just measured.
+  sendAck(pkt.seq, (uint16_t)len);
 }
 
 // -------------------- Arduino entrypoints --------------------
@@ -323,6 +408,7 @@ void setup()
   drawOLED();
 
   Serial.printf("Expecting TelemetryPacket size = %u bytes\n", (unsigned)sizeof(TelemetryPacket));
+  Serial.printf("AckPacket size = %u bytes\n", (unsigned)sizeof(AckPacket));
 }
 
 void loop()
