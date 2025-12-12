@@ -540,4 +540,161 @@ static void buildTelemetryPacket(TelemetryPacket &p)
 
   p.sats = (gps_sats > 255) ? 255 : (uint8_t)gps_sats;
 
-  // Po
+  // Power
+  double imA = isnan(current_mA_filt) ? 0.0 : (double)current_mA_filt;
+  if (imA > 32767)
+    imA = 32767;
+  if (imA < -32768)
+    imA = -32768;
+  p.current_mA = (int16_t)llround(imA);
+
+  double vmV = (double)loadV * 1000.0;
+  if (vmV < 0)
+    vmV = 0;
+  if (vmV > 65535)
+    vmV = 65535;
+  p.v_mV = (uint16_t)llround(vmV);
+
+  // mAh totals scaled by 1000
+  double net = net_mAh * 1000.0;
+  if (net > 2147483647.0)
+    net = 2147483647.0;
+  if (net < -2147483648.0)
+    net = -2147483648.0;
+  p.net_mAh_x1000 = (int32_t)llround(net);
+
+  double inx = mAh_in * 1000.0;
+  double outx = mAh_out * 1000.0;
+  if (inx < 0)
+    inx = 0;
+  if (inx > 4294967295.0)
+    inx = 4294967295.0;
+  if (outx < 0)
+    outx = 0;
+  if (outx > 4294967295.0)
+    outx = 4294967295.0;
+  p.in_mAh_x1000 = (uint32_t)llround(inx);
+  p.out_mAh_x1000 = (uint32_t)llround(outx);
+
+  // RX stats packed (if recent)
+  if (!isnan(lastRSSI) && (now - last_rx_ms) < 10000)
+  {
+    double r = lastRSSI;
+    if (r > 32767)
+      r = 32767;
+    if (r < -32768)
+      r = -32768;
+    p.rssi_dBm_x1 = (int16_t)llround(r);
+
+    double s10 = (double)lastSNR * 10.0;
+    if (s10 > 32767)
+      s10 = 32767;
+    if (s10 < -32768)
+      s10 = -32768;
+    p.snr_dB_x10 = (int16_t)llround(s10);
+  }
+  else
+  {
+    p.rssi_dBm_x1 = (int16_t)0x7FFF;
+    p.snr_dB_x10 = (int16_t)0x7FFF;
+  }
+
+  // CRC over all bytes except crc field itself
+  p.crc = 0;
+  p.crc = crc16_ccitt((const uint8_t *)&p, sizeof(p) - sizeof(p.crc));
+}
+
+static void handleTX()
+{
+  uint32_t now = millis();
+
+  bool tx_legal = (now - last_tx_ms) >= minimum_pause_ms;
+  bool timeToTx = (PAUSE > 0) && (now - last_tx_ms) >= (uint32_t)PAUSE * 1000UL;
+  bool buttonTx = button.isSingleClick();
+
+  if (!(timeToTx || buttonTx))
+    return;
+  if (!tx_legal)
+    return;
+
+  radio.clearDio1Action();
+
+  TelemetryPacket pkt;
+  buildTelemetryPacket(pkt);
+
+  heltec_led(50);
+  tx_time_ms = millis();
+  RADIOLIB(radio.transmit((uint8_t *)&pkt, sizeof(pkt)));
+  tx_time_ms = millis() - tx_time_ms;
+  heltec_led(0);
+
+  if (_radiolib_status != RADIOLIB_ERR_NONE)
+  {
+    Serial.printf("TX fail: %d\n", _radiolib_status);
+  }
+  else
+  {
+    Serial.printf("TX tlm %u bytes seq=%u\n", (unsigned)sizeof(pkt), (unsigned)pkt.seq);
+  }
+
+  minimum_pause_ms = tx_time_ms * 2;
+  last_tx_ms = millis();
+  txCounter++;
+
+  radio.setDio1Action(rx);
+  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
+}
+
+static void handleRX()
+{
+  if (!rxFlag)
+    return;
+  rxFlag = false;
+
+  // Read raw RX into string for now (you can switch to binary decode later)
+  radio.readData(rxdata);
+  if (_radiolib_status == RADIOLIB_ERR_NONE)
+  {
+    lastRSSI = radio.getRSSI();
+    lastSNR = radio.getSNR();
+    last_rx_ms = millis();
+    Serial.printf("RX [%s] RSSI=%.1f SNR=%.1f\n", rxdata.c_str(), lastRSSI, lastSNR);
+  }
+
+  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
+}
+
+// -------------------- Arduino entrypoints --------------------
+void setup()
+{
+  Serial.begin(115200);
+
+  heltec_setup();
+
+  display.init();
+  display.setFont(ArialMT_Plain_10);
+
+  initINA219();
+  gpsInit();
+  gpsResetAverager();
+  radioInit();
+
+  drawStatusOLED();
+
+  Serial.printf("TelemetryPacket size = %u bytes\n", (unsigned)sizeof(TelemetryPacket));
+}
+
+void loop()
+{
+  heltec_loop();
+
+  sampleAndIntegrateINA219();
+
+  gpsPoll();
+  gpsDumpToSerialTick();
+
+  handleTX();
+  handleRX();
+
+  oledTick();
+}
