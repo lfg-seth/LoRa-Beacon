@@ -6,10 +6,7 @@
  *   - Serial GPS dump
  *   - OLED shows: HDOP, ALT, LAT/LON (AVERAGED)
  *   - GPS quality indicator: POOR / NORMAL / EXCELLENT
- *
- * Averaging:
- * - Weighted average (weights based on HDOP) over a time window
- * - Only accumulates samples when GPS quality is at least NORMAL
+ * - Broadcast ALL stats as a binary struct over LoRa + CRC16
  */
 
 #define HELTEC_POWER_BUTTON
@@ -55,26 +52,23 @@ static TinyGPSPlus gps;
 static uint32_t last_gps_print_ms = 0;
 static const uint32_t GPS_PRINT_PERIOD_MS = 1000;
 
-// Fix staleness: if no valid location update in this time, treat as no-fix for OLED/quality
 static const uint32_t GPS_FIX_STALE_MS = 5000;
 
-// Quality thresholds (tune if you want)
 static const uint32_t GPS_SATS_NORMAL = 7;
 static const uint32_t GPS_SATS_EXCELLENT = 10;
 static const float GPS_HDOP_NORMAL = 3.0f;
 static const float GPS_HDOP_EXCELLENT = 1.5f;
 
-// Averaging window
 static const uint32_t GPS_AVG_WINDOW_MS = 120000; // 2 minutes
-static const uint32_t GPS_AVG_MIN_SAMPLES = 20;   // require at least N good samples before updating avg
+static const uint32_t GPS_AVG_MIN_SAMPLES = 20;
 
-// Cached latest raw values (for gating/serial)
+// Cached latest raw values
 static bool gps_has_fix = false;
 static float gps_lat = NAN, gps_lon = NAN, gps_alt_m = NAN, gps_hdop = NAN;
 static uint32_t gps_sats = 0;
 static uint32_t gps_last_fix_ms = 0;
 
-// Averaged values (what OLED will show)
+// Averaged values
 static bool gps_has_avg = false;
 static float gps_lat_avg = NAN, gps_lon_avg = NAN, gps_alt_avg_m = NAN, gps_hdop_avg = NAN;
 static uint32_t gps_avg_samples = 0;
@@ -124,6 +118,69 @@ static uint32_t last_rx_ms = 0;
 
 // OLED tick
 static uint32_t last_oled_ms = 0;
+
+// -------------------- Telemetry packet --------------------
+//
+// Little-endian packed struct, 40 bytes total.
+// Scaling:
+//  - lat/lon: int32 = degrees * 1e7
+//  - alt_dm:  int16 = meters * 10 (decimeters)
+//  - hdop_c:  uint16 = HDOP * 100 (centi-HDOP)
+//  - current_mA: int16 signed milliamps
+//  - v_mV: uint16 millivolts
+//  - net_mAh_x1000: int32 mAh * 1000
+//  - in/out_mAh_x1000: uint32 mAh * 1000
+//
+enum GpsQuality : uint8_t
+{
+  GPS_NOFIX = 0,
+  GPS_POOR = 1,
+  GPS_NORMAL = 2,
+  GPS_EXCELLENT = 3
+};
+
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc = 0xFFFF)
+{
+  for (size_t i = 0; i < len; i++)
+  {
+    crc ^= (uint16_t)data[i] << 8;
+    for (int b = 0; b < 8; b++)
+    {
+      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+    }
+  }
+  return crc;
+}
+
+struct __attribute__((packed)) TelemetryPacket
+{
+  uint32_t magic;    // 'TLMS' = 0x534D4C54 (little-endian)
+  uint8_t version;   // 1
+  uint8_t flags;     // bit0: has_fix, bit1: avg_used, bit2: charging
+  uint16_t seq;      // txCounter mod 65536
+  uint32_t uptime_s; // millis()/1000
+
+  int32_t lat_e7;      // deg * 1e7
+  int32_t lon_e7;      // deg * 1e7
+  int16_t alt_dm;      // meters * 10
+  uint16_t hdop_c;     // hdop * 100
+  uint8_t sats;        // satellites used
+  uint8_t gps_quality; // enum above
+
+  int16_t current_mA; // signed
+  uint16_t v_mV;      // loadV * 1000
+
+  int32_t net_mAh_x1000;  // net mAh * 1000
+  uint32_t in_mAh_x1000;  // in mAh * 1000
+  uint32_t out_mAh_x1000; // out mAh * 1000
+
+  int16_t rssi_dBm_x1; // last RX RSSI (if recent) else 0x7FFF
+  int16_t snr_dB_x10;  // last RX SNR * 10 (if recent) else 0x7FFF
+
+  uint16_t crc; // CRC16-CCITT of all prior bytes
+};
+
+static const uint32_t TLMS_MAGIC = 0x534D4C54; // 'TLMS'
 
 // -------------------- ISR --------------------
 void rx() { rxFlag = true; }
@@ -199,14 +256,6 @@ static const char *powerStateLabel()
 }
 
 // -------------------- GPS helpers --------------------
-enum GpsQuality
-{
-  GPS_NOFIX,
-  GPS_POOR,
-  GPS_NORMAL,
-  GPS_EXCELLENT
-};
-
 static GpsQuality gpsQualityNow()
 {
   if (!gps_has_fix)
@@ -214,7 +263,6 @@ static GpsQuality gpsQualityNow()
   if ((millis() - gps_last_fix_ms) > GPS_FIX_STALE_MS)
     return GPS_NOFIX;
 
-  // If we don't have hdop/sats, be conservative
   if (isnan(gps_hdop) || gps_sats == 0)
     return GPS_POOR;
 
@@ -246,7 +294,6 @@ static void gpsInit()
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.printf("GPS init: UART1 %lu baud (RX=%d TX=%d)\n",
                 (unsigned long)GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN);
-
   gps_window_start_ms = millis();
 }
 
@@ -264,11 +311,9 @@ static void gpsResetAverager()
 static void gpsMaybeFinalizeAverage()
 {
   uint32_t now = millis();
-  bool window_done = (now - gps_window_start_ms) >= GPS_AVG_WINDOW_MS;
-
-  if (!window_done)
+  if ((now - gps_window_start_ms) < GPS_AVG_WINDOW_MS)
     return;
-  // Window ended: compute if enough samples, then reset window either way
+
   if (gps_accum_samples >= GPS_AVG_MIN_SAMPLES && gps_wsum > 0.0)
   {
     gps_lat_avg = (float)(gps_lat_wsum / gps_wsum);
@@ -288,7 +333,6 @@ static void gpsPoll()
   while (GPSSerial.available() > 0)
     gps.encode((char)GPSSerial.read());
 
-  // Update raw cache when valid
   if (gps.location.isValid())
   {
     gps_lat = (float)gps.location.lat();
@@ -296,29 +340,22 @@ static void gpsPoll()
     gps_has_fix = true;
     gps_last_fix_ms = millis();
   }
-
   if (gps.altitude.isValid())
     gps_alt_m = (float)gps.altitude.meters();
-
   if (gps.hdop.isValid())
     gps_hdop = (float)gps.hdop.hdop();
-
   if (gps.satellites.isValid())
     gps_sats = (uint32_t)gps.satellites.value();
 
-  // Accumulate into averager if quality is NORMAL or better
   GpsQuality q = gpsQualityNow();
   if ((q == GPS_NORMAL || q == GPS_EXCELLENT) && !isnan(gps_hdop) && gps_hdop > 0.0f)
   {
-    // HDOP-weighted average: stronger weight for better (lower) HDOP
-    // Clamp HDOP to avoid insane weights if hdop reports tiny values
     const double hd = (double)max(0.6f, gps_hdop);
     const double w = 1.0 / (hd * hd);
 
     gps_wsum += w;
     gps_lat_wsum += (double)gps_lat * w;
     gps_lon_wsum += (double)gps_lon * w;
-
     if (!isnan(gps_alt_m))
       gps_alt_wsum += (double)gps_alt_m * w;
     if (!isnan(gps_hdop))
@@ -338,16 +375,13 @@ static void gpsDumpToSerialTick()
   last_gps_print_ms = now;
 
   GpsQuality q = gpsQualityNow();
-
-  Serial.printf("[GPS] q=%s fix=%s sats=%lu hdop=%s alt=%s lat=%s lon=%s age=%lums\n",
+  Serial.printf("[GPS] q=%s sats=%lu hdop=%s alt=%s lat=%s lon=%s\n",
                 gpsQualityLabel(q),
-                gps.location.isValid() ? "YES" : "NO",
                 (unsigned long)gps_sats,
                 isnan(gps_hdop) ? "INV" : String(gps_hdop, 2).c_str(),
                 isnan(gps_alt_m) ? "INV" : String(gps_alt_m, 1).c_str(),
                 gps_has_fix ? String(gps_lat, 5).c_str() : "INV",
-                gps_has_fix ? String(gps_lon, 5).c_str() : "INV",
-                (unsigned long)(gps.location.isValid() ? gps.location.age() : 0));
+                gps_has_fix ? String(gps_lon, 5).c_str() : "INV");
 
   if (gps_has_avg)
   {
@@ -358,30 +392,20 @@ static void gpsDumpToSerialTick()
   }
 }
 
-// -------------------- OLED helpers (ThingPulse style) --------------------
+// -------------------- OLED helpers --------------------
 static void drawStatusOLED()
 {
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.setFont(ArialMT_Plain_10);
 
-  // OLED layout (64px):
-  // y=0   title + GPS quality on right
-  // y=12  lat (avg if available)
-  // y=24  lon (avg if available)
-  // y=36  alt + hdop + sats (avg hdop/alt if available)
-  // y=48  current + power state
-  // y=56  RX recent else TX# + uptime
-
   GpsQuality q = gpsQualityNow();
 
   display.drawString(0, 0, "Heltec V3  GPS");
-
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
   display.drawString(128, 0, gpsQualityLabel(q));
   display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-  // Prefer averaged position if we have it and it's not too old
   bool avg_fresh = gps_has_avg && ((millis() - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
   float showLat = avg_fresh ? gps_lat_avg : gps_lat;
   float showLon = avg_fresh ? gps_lon_avg : gps_lon;
@@ -392,7 +416,6 @@ static void drawStatusOLED()
   display.drawString(0, 12, "Lat: " + latStr);
   display.drawString(0, 24, "Lon: " + lonStr);
 
-  // Alt/HDOP: show averaged if fresh, else raw
   float showAlt = avg_fresh ? gps_alt_avg_m : gps_alt_m;
   float showHdop = avg_fresh ? gps_hdop_avg : gps_hdop;
 
@@ -400,10 +423,8 @@ static void drawStatusOLED()
   String hdopStr = (!isnan(showHdop)) ? String(showHdop, 2) : String("--");
   String satsStr = (gps_sats > 0) ? String(gps_sats) : String("--");
 
-  String line3 = "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr;
-  display.drawString(0, 36, line3);
+  display.drawString(0, 36, "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr);
 
-  // Current + state
   String iStr = "I:" + String(current_mA_filt, 0) + "mA V:" + String(loadV, 2) + "V";
   display.drawString(0, 48, iStr);
 
@@ -411,15 +432,13 @@ static void drawStatusOLED()
   display.drawString(128, 48, powerStateLabel());
   display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-  // Bottom line
   if (!isnan(lastRSSI) && (millis() - last_rx_ms) < 10000)
   {
     display.drawString(0, 56, "RX R:" + String(lastRSSI, 0) + " S:" + String(lastSNR, 1));
   }
   else
   {
-    String b = "TX#" + String(txCounter) + " " + String(millis() / 1000) + "s";
-    display.drawString(0, 56, b);
+    display.drawString(0, 56, "TX#" + String(txCounter) + " " + String(millis() / 1000) + "s");
   }
 
   display.display();
@@ -450,86 +469,75 @@ static void radioInit()
   RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
 }
 
-static void handleTX()
+static void buildTelemetryPacket(TelemetryPacket &p)
 {
-  uint32_t now = millis();
+  memset(&p, 0, sizeof(p));
+  p.magic = TLMS_MAGIC;
+  p.version = 1;
 
-  bool tx_legal = (now - last_tx_ms) >= minimum_pause_ms;
-  bool timeToTx = (PAUSE > 0) && (now - last_tx_ms) >= (uint32_t)PAUSE * 1000UL;
-  bool buttonTx = button.isSingleClick();
+  const uint32_t now = millis();
+  p.uptime_s = now / 1000;
+  p.seq = (uint16_t)(txCounter & 0xFFFF);
 
-  if (!(timeToTx || buttonTx))
-    return;
-  if (!tx_legal)
-    return;
+  // Choose averaged GPS if fresh, else raw
+  bool avg_fresh = gps_has_avg && ((now - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
+  bool has_fix_fresh = gps_has_fix && ((now - gps_last_fix_ms) <= GPS_FIX_STALE_MS);
 
-  radio.clearDio1Action();
+  float lat = avg_fresh ? gps_lat_avg : gps_lat;
+  float lon = avg_fresh ? gps_lon_avg : gps_lon;
+  float altm = avg_fresh ? gps_alt_avg_m : gps_alt_m;
+  float hdop = avg_fresh ? gps_hdop_avg : gps_hdop;
 
-  heltec_led(50);
-  tx_time_ms = millis();
-  RADIOLIB(radio.transmit(String(txCounter).c_str()));
-  tx_time_ms = millis() - tx_time_ms;
-  heltec_led(0);
+  if (has_fix_fresh || avg_fresh)
+    p.flags |= (1u << 0);
+  if (avg_fresh)
+    p.flags |= (1u << 1);
+  if (current_mA_filt < -1.0f)
+    p.flags |= (1u << 2); // charging
 
-  if (_radiolib_status != RADIOLIB_ERR_NONE)
-    Serial.printf("TX fail: %d\n", _radiolib_status);
+  GpsQuality q = gpsQualityNow();
+  p.gps_quality = (uint8_t)q;
 
-  minimum_pause_ms = tx_time_ms * 2;
-  last_tx_ms = millis();
-  txCounter++;
-
-  radio.setDio1Action(rx);
-  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
-}
-
-static void handleRX()
-{
-  if (!rxFlag)
-    return;
-  rxFlag = false;
-
-  radio.readData(rxdata);
-  if (_radiolib_status == RADIOLIB_ERR_NONE)
+  // Scaled fields (guard NaNs)
+  if (!isnan(lat) && !isnan(lon) && (has_fix_fresh || avg_fresh))
   {
-    lastRSSI = radio.getRSSI();
-    lastSNR = radio.getSNR();
-    last_rx_ms = millis();
-
-    Serial.printf("RX [%s] RSSI=%.1f SNR=%.1f\n", rxdata.c_str(), lastRSSI, lastSNR);
+    p.lat_e7 = (int32_t)llround((double)lat * 1e7);
+    p.lon_e7 = (int32_t)llround((double)lon * 1e7);
+  }
+  else
+  {
+    p.lat_e7 = 0;
+    p.lon_e7 = 0;
   }
 
-  RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
-}
+  if (!isnan(altm))
+  {
+    double dm = (double)altm * 10.0;
+    if (dm > 32767)
+      dm = 32767;
+    if (dm < -32768)
+      dm = -32768;
+    p.alt_dm = (int16_t)llround(dm);
+  }
+  else
+  {
+    p.alt_dm = (int16_t)0x7FFF;
+  }
 
-// -------------------- Arduino entrypoints --------------------
-void setup()
-{
-  Serial.begin(115200);
+  if (!isnan(hdop))
+  {
+    double hc = (double)hdop * 100.0;
+    if (hc < 0)
+      hc = 0;
+    if (hc > 65535)
+      hc = 65535;
+    p.hdop_c = (uint16_t)llround(hc);
+  }
+  else
+  {
+    p.hdop_c = 0xFFFF;
+  }
 
-  heltec_setup();
+  p.sats = (gps_sats > 255) ? 255 : (uint8_t)gps_sats;
 
-  display.init();
-  display.setFont(ArialMT_Plain_10);
-
-  initINA219();
-  gpsInit();
-  radioInit();
-
-  gpsResetAverager();
-  drawStatusOLED();
-}
-
-void loop()
-{
-  heltec_loop();
-
-  sampleAndIntegrateINA219();
-
-  gpsPoll();
-  gpsDumpToSerialTick();
-
-  handleTX();
-  handleRX();
-
-  oledTick();
-}
+  // Po
