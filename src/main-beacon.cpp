@@ -69,6 +69,12 @@ static double gps_hdop_wsum = 0.0;
 static uint32_t gps_accum_samples = 0;
 static uint32_t gps_window_start_ms = 0;
 
+static bool gps_time_valid = false;
+static uint32_t gps_time_last_ms = 0;
+
+static int gps_year = 0, gps_mon = 0, gps_day = 0;
+static int gps_hour = 0, gps_min = 0, gps_sec = 0, gps_centi = 0;
+
 // -------------------- microSD (custom SPI bus) --------------------
 static const int SD_CS = 6;
 static const int SD_SCK = 4;
@@ -99,6 +105,20 @@ static float lastRSSI = NAN;
 static float lastSNR = NAN;
 static uint32_t last_rx_ms = 0;
 
+// --------- Last PONG metrics (decoded + measured) ----------
+static bool last_pong_valid = false;
+static uint32_t last_pong_ms = 0;
+static uint16_t last_pong_seq = 0;
+
+static float last_ping_rssi_rx = NAN;           // receiver-reported RSSI of our PING
+static float last_ping_snr_rx = NAN;            // receiver-reported SNR of our PING
+static int32_t last_ping_fe_hz_rx = 0x7FFFFFFF; // receiver-reported freq error on our PING
+static uint16_t last_ping_len_rx = 0;
+
+static float last_pong_rssi_beacon = NAN; // beacon-measured RSSI of PONG
+static float last_pong_snr_beacon = NAN;  // beacon-measured SNR of PONG
+static uint32_t last_pong_rtt_ms = 0;
+
 // OLED tick
 static uint32_t last_oled_ms = 0;
 
@@ -116,24 +136,16 @@ static const float ADC_MAX = 4095.0f;
 
 static float readVBAT()
 {
-// If heltec_unofficial provides heltec_vbat(), use it.
-// Many Heltec examples expose this helper.
-#if defined(HELTEC_WIRELESS_STICK) || defined(HELTEC_POWER_BUTTON)
-  // Try to call heltec_vbat() if it exists; if your compile fails here,
-  // comment this out and rely on ADC fallback below.
-  // (Leaving it in by default because it’s usually present in heltec_unofficial.)
-  extern float heltec_vbat(void);
-  float v = heltec_vbat();
-  if (!isnan(v) && v > 0.5f && v < 6.0f)
-    return v;
-#endif
+  // If heltec_unofficial provides heltec_vbat(), use it.
+  // Many Heltec examples expose this helper.
+  return heltec_vbat();
 
-  // Fallback ADC method
-  // NOTE: You may need analogReadMilliVolts() depending on your core version.
-  uint16_t raw = analogRead(VBAT_ADC_PIN);
-  float v_adc = (raw / ADC_MAX) * ADC_VREF;
-  float v_bat = v_adc * VBAT_DIVIDER;
-  return v_bat;
+  // // Fallback ADC method
+  // // NOTE: You may need analogReadMilliVolts() depending on your core version.
+  // uint16_t raw = analogRead(VBAT_ADC_PIN);
+  // float v_adc = (raw / ADC_MAX) * ADC_VREF;
+  // float v_bat = v_adc * VBAT_DIVIDER;
+  // return v_bat;
 }
 
 // -------------------- CRC16 --------------------
@@ -265,6 +277,7 @@ static void sdInit()
     {
       // Rich CSV header (stable columns)
       f.println(
+          "gps_utc_valid,gps_utc_year,gps_utc_mon,gps_utc_day,gps_utc_hour,gps_utc_min,gps_utc_sec,gps_utc_centis,gps_utc_age_ms,"
           "ms,event,"
           "uptime_s,seq,"
           "vbat_V,"
@@ -372,6 +385,25 @@ static void gpsPoll()
   if (gps.satellites.isValid())
     gps_sats = (uint32_t)gps.satellites.value();
 
+  if (gps.date.isValid() && gps.time.isValid())
+  {
+    gps_year = gps.date.year();
+    gps_mon = gps.date.month();
+    gps_day = gps.date.day();
+
+    gps_hour = gps.time.hour();
+    gps_min = gps.time.minute();
+    gps_sec = gps.time.second();
+    gps_centi = gps.time.centisecond();
+
+    gps_time_valid = true;
+    gps_time_last_ms = millis();
+  }
+  else if (gps_time_valid && (millis() - gps_time_last_ms) > GPS_FIX_STALE_MS)
+  {
+    gps_time_valid = false;
+  }
+
   GpsQuality q = gpsQualityNow();
   if ((q == GPS_NORMAL || q == GPS_EXCELLENT) && !isnan(gps_hdop) && gps_hdop > 0.0f)
   {
@@ -410,6 +442,41 @@ static void gpsDumpToSerialTick()
 }
 
 // -------------------- OLED helpers --------------------
+enum SigQuality : uint8_t
+{
+  SIG_POOR = 0,
+  SIG_GOOD = 1,
+  SIG_EXCELLENT = 2
+};
+
+static SigQuality signalQuality(float rssi_dBm, float snr_dB)
+{
+  if (isnan(rssi_dBm) || isnan(snr_dB))
+    return SIG_POOR;
+
+  // Tune these thresholds to your field results.
+  // LoRa is usually "useable" even with negative SNR at higher SF,
+  // but for a simple label this works well.
+  if (snr_dB >= 4.0f && rssi_dBm >= -110.0f)
+    return SIG_EXCELLENT;
+  if (snr_dB >= -2.0f && rssi_dBm >= -120.0f)
+    return SIG_GOOD;
+  return SIG_POOR;
+}
+
+static const char *sigQualityLabel(SigQuality q)
+{
+  switch (q)
+  {
+  case SIG_EXCELLENT:
+    return "EXCL";
+  case SIG_GOOD:
+    return "GOOD";
+  default:
+    return "POOR";
+  }
+}
+
 static void drawStatusOLED()
 {
   display.clear();
@@ -418,7 +485,6 @@ static void drawStatusOLED()
 
   GpsQuality q = gpsQualityNow();
 
-  display.drawString(0, 0, "Heltec V3  GPS");
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
   display.drawString(128, 0, gpsQualityLabel(q));
   display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -431,8 +497,10 @@ static void drawStatusOLED()
   String latStr = (gps_has_fix || avg_fresh) ? String(showLat, 5) : String("-----.-----");
   String lonStr = (gps_has_fix || avg_fresh) ? String(showLon, 5) : String("-----.-----");
 
-  display.drawString(0, 12, "Lat: " + latStr);
-  display.drawString(0, 24, "Lon: " + lonStr);
+  float vbat = readVBAT();
+
+  display.drawString(0, 0, "Lat: " + latStr + (sd_ok ? " SD" : " NOSD"));
+  display.drawString(0, 12, "Lon: " + lonStr + " V:" + String(vbat, 2));
 
   float showAlt = avg_fresh ? gps_alt_avg_m : gps_alt_m;
   float showHdop = avg_fresh ? gps_hdop_avg : gps_hdop;
@@ -441,14 +509,38 @@ static void drawStatusOLED()
   String hdopStr = (!isnan(showHdop)) ? String(showHdop, 2) : String("--");
   String satsStr = (gps_sats > 0) ? String(gps_sats) : String("--");
 
-  float vbat = readVBAT();
-  display.drawString(0, 36, "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr);
-  display.drawString(0, 48, String("SD: ") + (sd_ok ? "OK" : "FAIL") + " VBAT:" + String(vbat, 2));
+  display.drawString(0, 24, "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr);
 
-  if (!isnan(lastRSSI) && (millis() - last_rx_ms) < 10000)
-    display.drawString(0, 56, "RX R:" + String(lastRSSI, 0) + " S:" + String(lastSNR, 1) + " TX#" + String(txCounter));
+  // --- PING stats (receiver reported it received) ---
+  // Only valid if we've received at least one good PONG recently
+  bool pong_fresh = last_pong_valid && ((now - last_pong_ms) < 15000);
+
+  if (pong_fresh)
+  {
+    // PING quality as reported by receiver (what RX saw from our PING)
+    SigQuality pingQ = signalQuality(last_ping_rssi_rx, last_ping_snr_rx);
+
+    // PONG quality as measured locally (what we saw from their PONG)
+    SigQuality pongQ = signalQuality(last_pong_rssi_beacon, last_pong_snr_beacon);
+
+    display.drawString(
+        0, 36,
+        "R:" + String(last_ping_rssi_rx, 0) +
+            " S:" + String(last_ping_snr_rx, 1) +
+            String(sigQualityLabel(pingQ)));
+
+    display.drawString(
+        0, 48,
+        "R:" + String(last_pong_rssi_beacon, 0) +
+            " S:" + String(last_pong_snr_beacon, 1) +
+            String(sigQualityLabel(pongQ)));
+  }
   else
-    display.drawString(0, 56, String(millis() / 1000) + "s TX#" + String(txCounter));
+  {
+    // Fallback: show something useful while waiting for first PONG
+    display.drawString(0, 36, "PING@RX");
+    display.drawString(0, 48, "PONG@ME");
+  }
 
   display.display();
 }
@@ -605,7 +697,28 @@ static void appendCsvRow(
 
   // Build CSV line with consistent columns
   String line;
-  line.reserve(420);
+  line.reserve(640);
+
+  uint32_t utc_age = gps_time_valid ? (millis() - gps_time_last_ms) : 0;
+
+  line += String(gps_time_valid ? 1 : 0);
+  line += ",";
+  line += String(gps_year);
+  line += ",";
+  line += String(gps_mon);
+  line += ",";
+  line += String(gps_day);
+  line += ",";
+  line += String(gps_hour);
+  line += ",";
+  line += String(gps_min);
+  line += ",";
+  line += String(gps_sec);
+  line += ",";
+  line += String(gps_centi);
+  line += ",";
+  line += String((unsigned long)(gps_time_valid ? utc_age : 0));
+  line += ",";
 
   line += String(now);
   line += ",";
@@ -773,11 +886,14 @@ static void handleTX()
   {
     Serial.printf("PING TX fail: %d\n", _radiolib_status);
 
+    String status = "radiolib=";
+    status += _radiolib_status;
+
     appendCsvRow(
         "PING_FAIL",
         uptime_s,
         seq,
-        String("radiolib=").concat(String(_radiolib_status)).c_str(),
+        status.c_str(),
         -1,
         lastRSSI,
         lastSNR,
@@ -819,8 +935,23 @@ static void handleTX()
 
 static void logAckWithPingContext(const AckPacket &ack, float ack_rssi, float ack_snr)
 {
+
+  // Cache “PING stats” (receiver reported) + “PONG stats” (beacon measured)
   const uint32_t now = millis();
   const uint32_t rtt_ms = (last_tx_start_ms > 0) ? (now - last_tx_start_ms) : 0;
+
+  last_pong_valid = true;
+  last_pong_ms = millis();
+  last_pong_seq = ack.seq;
+
+  last_ping_rssi_rx = (float)ack.ping_rssi_dBm_x1;
+  last_ping_snr_rx = (float)ack.ping_snr_dB_x10 / 10.0f;
+  last_ping_fe_hz_rx = ack.ping_freqerr_Hz;
+  last_ping_len_rx = ack.ping_len;
+
+  last_pong_rssi_beacon = ack_rssi;
+  last_pong_snr_beacon = ack_snr;
+  last_pong_rtt_ms = rtt_ms;
 
   String pingFeStr = (ack.ping_freqerr_Hz == 0x7FFFFFFF) ? String("INV") : String((long)ack.ping_freqerr_Hz);
 
@@ -896,11 +1027,14 @@ static void handleRX()
   {
     Serial.printf("RX read fail: %d RSSI=%.1f SNR=%.1f len=%d\n", _radiolib_status, lastRSSI, lastSNR, (int)len);
 
+    char status[32];
+    snprintf(status, sizeof(status), "radiolib=%d", _radiolib_status);
+
     appendCsvRow(
         "RX_FAIL",
         millis() / 1000,
         last_tx_seq,
-        String("radiolib=").concat(String(_radiolib_status)).c_str(),
+        status,
         (int)len,
         lastRSSI,
         lastSNR,
@@ -928,11 +1062,14 @@ static void handleRX()
         Serial.printf("PONG (out-of-order) seq=%u (expected %u) RSSI=%.1f SNR=%.1f\n",
                       (unsigned)ack.seq, (unsigned)last_tx_seq, lastRSSI, lastSNR);
 
+        char status[32];
+        snprintf(status, sizeof(status), "expected=%u", (unsigned)last_tx_seq);
+
         appendCsvRow(
             "PONG_OOO",
             millis() / 1000,
             ack.seq,
-            String("expected=").concat(String((unsigned)last_tx_seq)).c_str(),
+            status,
             (int)sizeof(AckPacket),
             lastRSSI,
             lastSNR,
@@ -995,8 +1132,8 @@ void setup()
   display.setFont(ArialMT_Plain_10);
 
   // If ADC fallback is used, make sure pin is configured
-  analogReadResolution(12);
-  pinMode(VBAT_ADC_PIN, INPUT);
+  // analogReadResolution(12);
+  // pinMode(VBAT_ADC_PIN, INPUT);
 
   gpsInit();
   gpsResetAverager();
