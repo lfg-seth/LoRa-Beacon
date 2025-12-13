@@ -1,8 +1,8 @@
 /**
  * Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) - BEACON
  * - Raw LoRa TX/RX (no LoRaWAN)
- * - INA219 current sampling + EMA filter (SIGNED current supported)
  * - GPS (GT-U7) on UART pins 45/46
+ * - microSD logging over custom SPI pins (4/5/2 + CS=6)
  * - Broadcast TelemetryPacket over LoRa + CRC16 (PING)
  * - On ACK (PONG), logs:
  *     1) Original ping seq
@@ -15,9 +15,9 @@
 #include <heltec_unofficial.h>
 
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_INA219.h>
 #include <TinyGPSPlus.h>
+#include <SPI.h>
+#include <SD.h>
 
 // -------------------- LoRa settings --------------------
 #define PAUSE 1           // seconds (0 = only button)
@@ -25,22 +25,6 @@
 #define BANDWIDTH 125.0   // kHz
 #define SPREADING_FACTOR 9
 #define TRANSMIT_POWER 10 // dBm
-
-// -------------------- INA219 settings --------------------
-static const uint32_t INA_SAMPLE_PERIOD_MS = 200;
-static const float CURRENT_EMA_ALPHA = 0.15f;
-static const float ZERO_DEADBAND_mA = 3.0f;
-
-enum InaRangePreset
-{
-  INA_32V_2A,
-  INA_32V_1A,
-  INA_16V_400mA
-};
-static const InaRangePreset INA_PRESET = INA_32V_2A;
-
-static const int INA_SDA_PIN = 6;
-static const int INA_SCL_PIN = 7;
 
 // -------------------- GPS (GT-U7) --------------------
 static const int GPS_RX_PIN = 45; // ESP32 RX  <- GPS TX
@@ -84,32 +68,26 @@ static double gps_hdop_wsum = 0.0;
 static uint32_t gps_accum_samples = 0;
 static uint32_t gps_window_start_ms = 0;
 
+// -------------------- microSD (custom SPI bus) --------------------
+static const int SD_CS = 6;
+static const int SD_SCK = 4;
+static const int SD_MISO = 2;
+static const int SD_MOSI = 5;
+
+static SPIClass SDSPI(FSPI); // separate SPI peripheral
+static bool sd_ok = false;
+static const char *SD_PATH = "/beacon.csv";
+
 // -------------------- OLED timing --------------------
 static const uint32_t OLED_PERIOD_MS = 250;
 
 // -------------------- Globals --------------------
-Adafruit_INA219 ina219;
-
 volatile bool rxFlag = false;
 
 long txCounter = 0;
 uint32_t last_tx_ms = 0;
 uint32_t minimum_pause_ms = 0;
 uint32_t tx_time_ms = 0;
-
-// INA readings
-static uint32_t last_ina_sample_ms = 0;
-static float current_mA_raw = 0.0f; // signed
-static float current_mA_filt = NAN; // signed
-static float busV = 0.0f;
-static float shunt_mV = 0.0f;
-static float loadV = 0.0f;
-
-// Accumulators (signed + split)
-static double net_mAh = 0.0;
-static double mAh_out = 0.0;
-static double mAh_in = 0.0;
-static double net_Wh = 0.0;
 
 // Latest RX stats at BEACON (for whatever it last received)
 static float lastRSSI = NAN;
@@ -150,7 +128,7 @@ struct __attribute__((packed)) TelemetryPacket
 {
   uint32_t magic;    // 'TLMS' = 0x534D4C54 (little-endian)
   uint8_t version;   // 1
-  uint8_t flags;     // bit0: has_fix, bit1: avg_used, bit2: charging
+  uint8_t flags;     // bit0: has_fix, bit1: avg_used, bit2: charging (unused now)
   uint16_t seq;      // txCounter mod 65536
   uint32_t uptime_s; // millis()/1000
 
@@ -161,12 +139,13 @@ struct __attribute__((packed)) TelemetryPacket
   uint8_t sats;        // satellites used
   uint8_t gps_quality; // enum above
 
-  int16_t current_mA; // signed
-  uint16_t v_mV;      // loadV * 1000
+  // INA219 removed -> these fields are kept for compatibility and set to 0 / sentinel
+  int16_t current_mA; // signed (0)
+  uint16_t v_mV;      // (0)
 
-  int32_t net_mAh_x1000;  // net mAh * 1000
-  uint32_t in_mAh_x1000;  // in mAh * 1000
-  uint32_t out_mAh_x1000; // out mAh * 1000
+  int32_t net_mAh_x1000;  // (0)
+  uint32_t in_mAh_x1000;  // (0)
+  uint32_t out_mAh_x1000; // (0)
 
   int16_t rssi_dBm_x1; // last RX RSSI (if recent) else 0x7FFF
   int16_t snr_dB_x10;  // last RX SNR * 10 (if recent) else 0x7FFF
@@ -214,74 +193,47 @@ static bool decodeAck(const uint8_t *buf, size_t len, AckPacket &out)
 // -------------------- ISR --------------------
 void rx() { rxFlag = true; }
 
-// -------------------- INA helpers --------------------
-static void initINA219()
+// -------------------- SD helpers --------------------
+static void sdAppendLine(const String &line)
 {
-  Wire1.begin(INA_SDA_PIN, INA_SCL_PIN);
+  if (!sd_ok)
+    return;
 
-  if (!ina219.begin(&Wire1))
+  File f = SD.open(SD_PATH, FILE_APPEND);
+  if (!f)
   {
-    Serial.println("INA219 not found (Wire1). Check wiring/address.");
+    sd_ok = false; // mark failed so OLED shows it
+    return;
+  }
+  f.println(line);
+  f.close();
+}
+
+static void sdInit()
+{
+  // Bring up a separate SPI bus for SD
+  SDSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  if (!SD.begin(SD_CS, SDSPI))
+  {
+    Serial.println("SD init failed.");
+    sd_ok = false;
     return;
   }
 
-  switch (INA_PRESET)
+  sd_ok = true;
+  Serial.println("SD init OK.");
+
+  // If file doesn't exist, create with header
+  if (!SD.exists(SD_PATH))
   {
-  case INA_16V_400mA:
-    ina219.setCalibration_16V_400mA();
-    break;
-  case INA_32V_1A:
-    ina219.setCalibration_32V_1A();
-    break;
-  case INA_32V_2A:
-  default:
-    ina219.setCalibration_32V_2A();
-    break;
+    File f = SD.open(SD_PATH, FILE_WRITE);
+    if (f)
+    {
+      f.println("ms,type,msg");
+      f.close();
+    }
   }
-
-  last_ina_sample_ms = millis();
-}
-
-static void sampleAndIntegrateINA219()
-{
-  uint32_t now = millis();
-  uint32_t dt_ms = now - last_ina_sample_ms;
-  if (dt_ms < INA_SAMPLE_PERIOD_MS)
-    return;
-  last_ina_sample_ms = now;
-
-  shunt_mV = ina219.getShuntVoltage_mV();
-  busV = ina219.getBusVoltage_V();
-  loadV = busV + (shunt_mV / 1000.0f);
-
-  current_mA_raw = ina219.getCurrent_mA(); // signed
-
-  if (fabsf(current_mA_raw) < ZERO_DEADBAND_mA)
-    current_mA_raw = 0.0f;
-
-  if (isnan(current_mA_filt))
-    current_mA_filt = current_mA_raw;
-  current_mA_filt = (CURRENT_EMA_ALPHA * current_mA_raw) + ((1.0f - CURRENT_EMA_ALPHA) * current_mA_filt);
-
-  const double dt_hours = (double)dt_ms / 3600000.0;
-
-  net_mAh += (double)current_mA_filt * dt_hours;
-  if (current_mA_filt >= 0.0f)
-    mAh_out += (double)current_mA_filt * dt_hours;
-  else
-    mAh_in += (double)(-current_mA_filt) * dt_hours;
-
-  const double watts = ((double)loadV * (double)current_mA_filt) / 1000.0; // signed
-  net_Wh += watts * dt_hours;
-}
-
-static const char *powerStateLabel()
-{
-  if (fabsf(current_mA_filt) < 1.0f)
-    return "IDLE";
-  if (current_mA_filt < 0.0f)
-    return "CHG";
-  return "DIS";
 }
 
 // -------------------- GPS helpers --------------------
@@ -446,17 +398,14 @@ static void drawStatusOLED()
 
   display.drawString(0, 36, "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr);
 
-  String iStr = "I:" + String(current_mA_filt, 0) + "mA V:" + String(loadV, 2) + "V";
-  display.drawString(0, 48, iStr);
+  // SD status line
+  display.drawString(0, 48, String("SD: ") + (sd_ok ? "OK" : "FAIL") + "  TX#" + String(txCounter));
 
-  display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  display.drawString(128, 48, powerStateLabel());
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-
+  // RX status / last packet stats
   if (!isnan(lastRSSI) && (millis() - last_rx_ms) < 10000)
     display.drawString(0, 56, "RX R:" + String(lastRSSI, 0) + " S:" + String(lastSNR, 1));
   else
-    display.drawString(0, 56, "TX#" + String(txCounter) + " " + String(millis() / 1000) + "s");
+    display.drawString(0, 56, String(millis() / 1000) + "s");
 
   display.display();
 }
@@ -508,8 +457,7 @@ static void buildTelemetryPacket(TelemetryPacket &p)
     p.flags |= (1u << 0);
   if (avg_fresh)
     p.flags |= (1u << 1);
-  if (current_mA_filt < -1.0f)
-    p.flags |= (1u << 2);
+  // bit2 (charging) unused now
 
   p.gps_quality = (uint8_t)gpsQualityNow();
 
@@ -549,39 +497,12 @@ static void buildTelemetryPacket(TelemetryPacket &p)
 
   p.sats = (gps_sats > 255) ? 255 : (uint8_t)gps_sats;
 
-  double imA = isnan(current_mA_filt) ? 0.0 : (double)current_mA_filt;
-  if (imA > 32767)
-    imA = 32767;
-  if (imA < -32768)
-    imA = -32768;
-  p.current_mA = (int16_t)llround(imA);
-
-  double vmV = (double)loadV * 1000.0;
-  if (vmV < 0)
-    vmV = 0;
-  if (vmV > 65535)
-    vmV = 65535;
-  p.v_mV = (uint16_t)llround(vmV);
-
-  double net = net_mAh * 1000.0;
-  if (net > 2147483647.0)
-    net = 2147483647.0;
-  if (net < -2147483648.0)
-    net = -2147483648.0;
-  p.net_mAh_x1000 = (int32_t)llround(net);
-
-  double inx = mAh_in * 1000.0;
-  double outx = mAh_out * 1000.0;
-  if (inx < 0)
-    inx = 0;
-  if (inx > 4294967295.0)
-    inx = 4294967295.0;
-  if (outx < 0)
-    outx = 0;
-  if (outx > 4294967295.0)
-    outx = 4294967295.0;
-  p.in_mAh_x1000 = (uint32_t)llround(inx);
-  p.out_mAh_x1000 = (uint32_t)llround(outx);
+  // INA removed -> keep these at 0 for now
+  p.current_mA = 0;
+  p.v_mV = 0;
+  p.net_mAh_x1000 = 0;
+  p.in_mAh_x1000 = 0;
+  p.out_mAh_x1000 = 0;
 
   if (!isnan(lastRSSI) && (now - last_rx_ms) < 10000)
   {
@@ -636,13 +557,19 @@ static void handleTX()
 
   if (_radiolib_status != RADIOLIB_ERR_NONE)
   {
+    String s = String(millis()) + ",PING_FAIL," + String(_radiolib_status);
     Serial.printf("PING TX fail: %d\n", _radiolib_status);
+    sdAppendLine(s);
   }
   else
   {
     Serial.printf("PING tx %u bytes seq=%u (air=%lums)\n",
                   (unsigned)sizeof(pkt), (unsigned)pkt.seq, (unsigned long)tx_time_ms);
     last_tx_seq = pkt.seq;
+
+    String s = String(millis()) + ",PING_TX,seq=" + String(pkt.seq) + " bytes=" + String((unsigned)sizeof(pkt)) +
+               " airMs=" + String((unsigned long)tx_time_ms);
+    sdAppendLine(s);
   }
 
   minimum_pause_ms = tx_time_ms * 2;
@@ -659,19 +586,34 @@ static void logAckWithPingContext(const AckPacket &ack, float ack_rssi, float ac
 
   const char *ping_fe = (ack.ping_freqerr_Hz == 0x7FFFFFFF) ? "INV" : String((long)ack.ping_freqerr_Hz).c_str();
 
-  Serial.printf(
-      "PONG seq=%u rtt=%lums | beaconTX{seq=%u} "
-      "| rxPing{R=%ddBm S=%.1fdB FE=%sHz len=%u rxUp=%lus} "
-      "| beaconRxAck{R=%.1fdBm S=%.1fdB}\n",
-      (unsigned)ack.seq,
-      (unsigned long)rtt_ms,
-      (unsigned)last_tx_seq,
-      (int)ack.ping_rssi_dBm_x1,
-      (double)ack.ping_snr_dB_x10 / 10.0,
-      ping_fe,
-      (unsigned)ack.ping_len,
-      (unsigned long)ack.rx_uptime_s,
-      ack_rssi, ack_snr);
+  String line;
+  line.reserve(220);
+  line += "PONG seq=";
+  line += String((unsigned)ack.seq);
+  line += " rtt=";
+  line += String((unsigned long)rtt_ms);
+  line += "ms | beaconTX{seq=";
+  line += String((unsigned)last_tx_seq);
+  line += "} | rxPing{R=";
+  line += String((int)ack.ping_rssi_dBm_x1);
+  line += "dBm S=";
+  line += String((double)ack.ping_snr_dB_x10 / 10.0, 1);
+  line += "dB FE=";
+  line += ping_fe;
+  line += "Hz len=";
+  line += String((unsigned)ack.ping_len);
+  line += " rxUp=";
+  line += String((unsigned long)ack.rx_uptime_s);
+  line += "s} | beaconRxAck{R=";
+  line += String(ack_rssi, 1);
+  line += "dBm S=";
+  line += String(ack_snr, 1);
+  line += "dB}";
+
+  Serial.println(line);
+
+  // CSV log entry
+  sdAppendLine(String(millis()) + ",PONG," + line);
 }
 
 static void handleRX()
@@ -692,6 +634,8 @@ static void handleRX()
   if (_radiolib_status != RADIOLIB_ERR_NONE)
   {
     Serial.printf("RX read fail: %d RSSI=%.1f SNR=%.1f len=%d\n", _radiolib_status, lastRSSI, lastSNR, (int)len);
+    sdAppendLine(String(millis()) + ",RX_FAIL,status=" + String(_radiolib_status) +
+                 " rssi=" + String(lastRSSI, 1) + " snr=" + String(lastSNR, 1) + " len=" + String((int)len));
     RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
     return;
   }
@@ -704,17 +648,25 @@ static void handleRX()
       if (ack.seq == last_tx_seq)
         logAckWithPingContext(ack, lastRSSI, lastSNR);
       else
+      {
         Serial.printf("PONG (out-of-order) seq=%u (expected %u) RSSI=%.1f SNR=%.1f\n",
                       (unsigned)ack.seq, (unsigned)last_tx_seq, lastRSSI, lastSNR);
+        sdAppendLine(String(millis()) + ",PONG_OOO,seq=" + String((unsigned)ack.seq) +
+                     " expected=" + String((unsigned)last_tx_seq) +
+                     " rssi=" + String(lastRSSI, 1) + " snr=" + String(lastSNR, 1));
+      }
     }
     else
     {
       Serial.printf("RX invalid ACK (crc/magic) RSSI=%.1f SNR=%.1f\n", lastRSSI, lastSNR);
+      sdAppendLine(String(millis()) + ",ACK_BAD,rssi=" + String(lastRSSI, 1) + " snr=" + String(lastSNR, 1));
     }
   }
   else
   {
     Serial.printf("RX unknown len=%d RSSI=%.1f SNR=%.1f\n", (int)len, lastRSSI, lastSNR);
+    sdAppendLine(String(millis()) + ",RX_UNKNOWN,len=" + String((int)len) +
+                 " rssi=" + String(lastRSSI, 1) + " snr=" + String(lastSNR, 1));
   }
 
   RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
@@ -730,22 +682,23 @@ void setup()
   display.init();
   display.setFont(ArialMT_Plain_10);
 
-  initINA219();
   gpsInit();
   gpsResetAverager();
   radioInit();
+
+  sdInit(); // <-- SD after core init; logs status to OLED
 
   drawStatusOLED();
 
   Serial.printf("TelemetryPacket size = %u bytes\n", (unsigned)sizeof(TelemetryPacket));
   Serial.printf("AckPacket size       = %u bytes\n", (unsigned)sizeof(AckPacket));
+
+  sdAppendLine(String(millis()) + ",BOOT,beacon started");
 }
 
 void loop()
 {
   heltec_loop();
-
-  sampleAndIntegrateINA219();
 
   gpsPoll();
   gpsDumpToSerialTick();
@@ -755,4 +708,3 @@ void loop()
 
   oledTick();
 }
-
