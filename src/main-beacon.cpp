@@ -8,6 +8,7 @@
  *     1) Original ping seq
  *     2) Receiver-measured metrics for ping (beacon TX data)
  *     3) Beacon-measured metrics for ACK (beacon RX data)
+ * - Rich CSV logging: GPS, VBAT, radio settings, TX airtime, RTT, RSSI/SNR, etc.
  */
 
 #define HELTEC_POWER_BUTTON
@@ -18,6 +19,7 @@
 #include <TinyGPSPlus.h>
 #include <SPI.h>
 #include <SD.h>
+#include <math.h>
 
 // -------------------- LoRa settings --------------------
 #define PAUSE 1           // seconds (0 = only button)
@@ -36,7 +38,6 @@ static TinyGPSPlus gps;
 
 static uint32_t last_gps_print_ms = 0;
 static const uint32_t GPS_PRINT_PERIOD_MS = 1000;
-
 static const uint32_t GPS_FIX_STALE_MS = 5000;
 
 static const uint32_t GPS_SATS_NORMAL = 7;
@@ -81,6 +82,10 @@ static const char *SD_PATH = "/beacon.csv";
 // -------------------- OLED timing --------------------
 static const uint32_t OLED_PERIOD_MS = 250;
 
+// -------------------- Periodic STATUS logging --------------------
+static const uint32_t STATUS_LOG_PERIOD_MS = 1000;
+static uint32_t last_status_log_ms = 0;
+
 // -------------------- Globals --------------------
 volatile bool rxFlag = false;
 
@@ -100,6 +105,36 @@ static uint32_t last_oled_ms = 0;
 // Track last TX packet so we can correlate ACKs
 static uint16_t last_tx_seq = 0;
 static uint32_t last_tx_start_ms = 0;
+
+// -------------------- Battery (VBAT) --------------------
+// Primary: heltec_vbat() if provided by heltec_unofficial.
+// Fallback: ADC pin method (adjust to your board if needed).
+static const int VBAT_ADC_PIN = 1;      // Common on Heltec V3 variants, may differ
+static const float VBAT_DIVIDER = 2.0f; // If VBAT is halved before ADC (common). Adjust if wrong.
+static const float ADC_VREF = 3.3f;     // ESP32-S3 ADC reference-ish (approx; calibration varies)
+static const float ADC_MAX = 4095.0f;
+
+static float readVBAT()
+{
+// If heltec_unofficial provides heltec_vbat(), use it.
+// Many Heltec examples expose this helper.
+#if defined(HELTEC_WIRELESS_STICK) || defined(HELTEC_POWER_BUTTON)
+  // Try to call heltec_vbat() if it exists; if your compile fails here,
+  // comment this out and rely on ADC fallback below.
+  // (Leaving it in by default because it’s usually present in heltec_unofficial.)
+  extern float heltec_vbat(void);
+  float v = heltec_vbat();
+  if (!isnan(v) && v > 0.5f && v < 6.0f)
+    return v;
+#endif
+
+  // Fallback ADC method
+  // NOTE: You may need analogReadMilliVolts() depending on your core version.
+  uint16_t raw = analogRead(VBAT_ADC_PIN);
+  float v_adc = (raw / ADC_MAX) * ADC_VREF;
+  float v_bat = v_adc * VBAT_DIVIDER;
+  return v_bat;
+}
 
 // -------------------- CRC16 --------------------
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc = 0xFFFF)
@@ -168,7 +203,7 @@ struct __attribute__((packed)) AckPacket
   int16_t ping_rssi_dBm_x1; // RSSI seen by receiver on PING
   int16_t ping_snr_dB_x10;  // SNR*10 seen by receiver on PING
   int32_t ping_freqerr_Hz;  // frequency error seen by receiver on PING (if available), else 0x7FFFFFFF
-  uint16_t ping_len;        // length of received PING in bytes (expected 40)
+  uint16_t ping_len;        // length of received PING
 
   uint16_t crc; // CRC16-CCITT of all prior bytes
 };
@@ -202,7 +237,7 @@ static void sdAppendLine(const String &line)
   File f = SD.open(SD_PATH, FILE_APPEND);
   if (!f)
   {
-    sd_ok = false; // mark failed so OLED shows it
+    sd_ok = false;
     return;
   }
   f.println(line);
@@ -211,7 +246,6 @@ static void sdAppendLine(const String &line)
 
 static void sdInit()
 {
-  // Bring up a separate SPI bus for SD
   SDSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
   if (!SD.begin(SD_CS, SDSPI))
@@ -224,13 +258,23 @@ static void sdInit()
   sd_ok = true;
   Serial.println("SD init OK.");
 
-  // If file doesn't exist, create with header
   if (!SD.exists(SD_PATH))
   {
     File f = SD.open(SD_PATH, FILE_WRITE);
     if (f)
     {
-      f.println("ms,type,msg");
+      // Rich CSV header (stable columns)
+      f.println(
+          "ms,event,"
+          "uptime_s,seq,"
+          "vbat_V,"
+          "gps_has_fix,gps_avg_used,gps_quality,gps_sats,gps_hdop,gps_alt_m,gps_lat,gps_lon,"
+          "gps_avg_samples,gps_avg_hdop,gps_avg_alt_m,gps_avg_lat,gps_avg_lon,"
+          "radio_freq_MHz,radio_bw_kHz,radio_sf,radio_txpwr_dBm,"
+          "tx_air_ms,min_pause_ms,"
+          "rx_rssi_dBm,rx_snr_dB,rx_age_ms,rx_len,"
+          "pong_rx_uptime_s,pong_ping_rssi_dBm,pong_ping_snr_dB,pong_ping_freqerr_Hz,pong_ping_len,pong_rtt_ms,"
+          "status");
       f.close();
     }
   }
@@ -379,7 +423,8 @@ static void drawStatusOLED()
   display.drawString(128, 0, gpsQualityLabel(q));
   display.setTextAlignment(TEXT_ALIGN_LEFT);
 
-  bool avg_fresh = gps_has_avg && ((millis() - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
+  uint32_t now = millis();
+  bool avg_fresh = gps_has_avg && ((now - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
   float showLat = avg_fresh ? gps_lat_avg : gps_lat;
   float showLon = avg_fresh ? gps_lon_avg : gps_lon;
 
@@ -396,16 +441,14 @@ static void drawStatusOLED()
   String hdopStr = (!isnan(showHdop)) ? String(showHdop, 2) : String("--");
   String satsStr = (gps_sats > 0) ? String(gps_sats) : String("--");
 
+  float vbat = readVBAT();
   display.drawString(0, 36, "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr);
+  display.drawString(0, 48, String("SD: ") + (sd_ok ? "OK" : "FAIL") + " VBAT:" + String(vbat, 2));
 
-  // SD status line
-  display.drawString(0, 48, String("SD: ") + (sd_ok ? "OK" : "FAIL") + "  TX#" + String(txCounter));
-
-  // RX status / last packet stats
   if (!isnan(lastRSSI) && (millis() - last_rx_ms) < 10000)
-    display.drawString(0, 56, "RX R:" + String(lastRSSI, 0) + " S:" + String(lastSNR, 1));
+    display.drawString(0, 56, "RX R:" + String(lastRSSI, 0) + " S:" + String(lastSNR, 1) + " TX#" + String(txCounter));
   else
-    display.drawString(0, 56, String(millis() / 1000) + "s");
+    display.drawString(0, 56, String(millis() / 1000) + "s TX#" + String(txCounter));
 
   display.display();
 }
@@ -457,7 +500,6 @@ static void buildTelemetryPacket(TelemetryPacket &p)
     p.flags |= (1u << 0);
   if (avg_fresh)
     p.flags |= (1u << 1);
-  // bit2 (charging) unused now
 
   p.gps_quality = (uint8_t)gpsQualityNow();
 
@@ -497,7 +539,7 @@ static void buildTelemetryPacket(TelemetryPacket &p)
 
   p.sats = (gps_sats > 255) ? 255 : (uint8_t)gps_sats;
 
-  // INA removed -> keep these at 0 for now
+  // INA removed -> keep these at 0
   p.current_mA = 0;
   p.v_mV = 0;
   p.net_mAh_x1000 = 0;
@@ -530,6 +572,175 @@ static void buildTelemetryPacket(TelemetryPacket &p)
   p.crc = crc16_ccitt((const uint8_t *)&p, sizeof(p) - sizeof(p.crc));
 }
 
+// -------------------- CSV logging helpers --------------------
+static void appendCsvRow(
+    const char *event,
+    uint32_t uptime_s,
+    uint16_t seq,
+    const char *status,
+    // RX basics (beacon side)
+    int rx_len,
+    float rx_rssi,
+    float rx_snr,
+    uint32_t rx_age_ms,
+    // TX basics
+    uint32_t tx_air_ms_local,
+    uint32_t min_pause_ms_local,
+    // PONG fields (or sentinel)
+    const AckPacket *ack,
+    uint32_t pong_rtt_ms)
+{
+  float vbat = readVBAT();
+  uint32_t now = millis();
+
+  bool avg_fresh = gps_has_avg && ((now - gps_last_avg_ms) < (GPS_AVG_WINDOW_MS * 2));
+  bool has_fix_fresh = gps_has_fix && ((now - gps_last_fix_ms) <= GPS_FIX_STALE_MS);
+
+  float showLat = avg_fresh ? gps_lat_avg : gps_lat;
+  float showLon = avg_fresh ? gps_lon_avg : gps_lon;
+  float showAlt = avg_fresh ? gps_alt_avg_m : gps_alt_m;
+  float showHdop = avg_fresh ? gps_hdop_avg : gps_hdop;
+
+  GpsQuality q = gpsQualityNow();
+
+  // Build CSV line with consistent columns
+  String line;
+  line.reserve(420);
+
+  line += String(now);
+  line += ",";
+  line += event;
+  line += ",";
+  line += String(uptime_s);
+  line += ",";
+  line += String((unsigned)seq);
+  line += ",";
+
+  line += String(vbat, 3);
+  line += ",";
+
+  line += String(has_fix_fresh ? 1 : 0);
+  line += ",";
+  line += String(avg_fresh ? 1 : 0);
+  line += ",";
+  line += String((unsigned)q);
+  line += ",";
+  line += String((unsigned long)gps_sats);
+  line += ",";
+  line += (isnan(showHdop) ? "" : String(showHdop, 2));
+  line += ",";
+  line += (isnan(showAlt) ? "" : String(showAlt, 1));
+  line += ",";
+  line += ((has_fix_fresh || avg_fresh) && !isnan(showLat) ? String(showLat, 7) : "");
+  line += ",";
+  line += ((has_fix_fresh || avg_fresh) && !isnan(showLon) ? String(showLon, 7) : "");
+  line += ",";
+
+  line += String((unsigned long)gps_avg_samples);
+  line += ",";
+  line += (isnan(gps_hdop_avg) ? "" : String(gps_hdop_avg, 2));
+  line += ",";
+  line += (isnan(gps_alt_avg_m) ? "" : String(gps_alt_avg_m, 1));
+  line += ",";
+  line += (gps_has_avg ? String(gps_lat_avg, 7) : "");
+  line += ",";
+  line += (gps_has_avg ? String(gps_lon_avg, 7) : "");
+  line += ",";
+
+  line += String(FREQUENCY, 3);
+  line += ",";
+  line += String(BANDWIDTH, 1);
+  line += ",";
+  line += String(SPREADING_FACTOR);
+  line += ",";
+  line += String(TRANSMIT_POWER);
+  line += ",";
+
+  line += String((unsigned long)tx_air_ms_local);
+  line += ",";
+  line += String((unsigned long)min_pause_ms_local);
+  line += ",";
+
+  if (!isnan(rx_rssi))
+    line += String(rx_rssi, 1);
+  line += ",";
+  if (!isnan(rx_snr))
+    line += String(rx_snr, 1);
+  line += ",";
+  line += String((unsigned long)rx_age_ms);
+  line += ",";
+  line += String(rx_len);
+  line += ",";
+
+  // PONG fields
+  if (ack)
+  {
+    line += String((unsigned long)ack->rx_uptime_s);
+    line += ",";
+    line += String((int)ack->ping_rssi_dBm_x1);
+    line += ",";
+    line += String((double)ack->ping_snr_dB_x10 / 10.0, 1);
+    line += ",";
+    if (ack->ping_freqerr_Hz == 0x7FFFFFFF)
+      line += "";
+    else
+      line += String((long)ack->ping_freqerr_Hz);
+    line += ",";
+    line += String((unsigned)ack->ping_len);
+    line += ",";
+    line += String((unsigned long)pong_rtt_ms);
+    line += ",";
+  }
+  else
+  {
+    // Empty columns when no ack
+    line += ",,,,,,";
+  }
+
+  line += status ? status : "";
+  sdAppendLine(line);
+}
+
+static void logStatusTick()
+{
+  uint32_t now = millis();
+  if (now - last_status_log_ms < STATUS_LOG_PERIOD_MS)
+    return;
+  last_status_log_ms = now;
+
+  uint32_t uptime_s = now / 1000;
+
+  uint32_t rx_age = (!isnan(lastRSSI) ? (now - last_rx_ms) : 0xFFFFFFFF);
+
+  // Serial breadcrumb
+  Serial.printf("[STATUS] t=%lus vbat=%.2f gps=%s sats=%lu hdop=%s lat=%s lon=%s lastRxAge=%lums rssi=%s snr=%s\n",
+                (unsigned long)uptime_s,
+                readVBAT(),
+                gpsQualityLabel(gpsQualityNow()),
+                (unsigned long)gps_sats,
+                isnan(gps_hdop) ? "INV" : String(gps_hdop, 2).c_str(),
+                gps_has_fix ? String(gps_lat, 5).c_str() : "INV",
+                gps_has_fix ? String(gps_lon, 5).c_str() : "INV",
+                (unsigned long)(rx_age == 0xFFFFFFFF ? 0 : rx_age),
+                isnan(lastRSSI) ? "INV" : String(lastRSSI, 1).c_str(),
+                isnan(lastSNR) ? "INV" : String(lastSNR, 1).c_str());
+
+  appendCsvRow(
+      "STATUS",
+      uptime_s,
+      last_tx_seq,
+      sd_ok ? "ok" : "sd_fail",
+      -1,
+      lastRSSI,
+      lastSNR,
+      (rx_age == 0xFFFFFFFF ? 0 : rx_age),
+      tx_time_ms,
+      minimum_pause_ms,
+      nullptr,
+      0);
+}
+
+// -------------------- TX / RX --------------------
 static void handleTX()
 {
   uint32_t now = millis();
@@ -555,21 +766,47 @@ static void handleTX()
   tx_time_ms = millis() - tx_time_ms;
   heltec_led(0);
 
+  uint32_t uptime_s = millis() / 1000;
+  uint16_t seq = pkt.seq;
+
   if (_radiolib_status != RADIOLIB_ERR_NONE)
   {
-    String s = String(millis()) + ",PING_FAIL," + String(_radiolib_status);
     Serial.printf("PING TX fail: %d\n", _radiolib_status);
-    sdAppendLine(s);
+
+    appendCsvRow(
+        "PING_FAIL",
+        uptime_s,
+        seq,
+        String("radiolib=").concat(String(_radiolib_status)).c_str(),
+        -1,
+        lastRSSI,
+        lastSNR,
+        (!isnan(lastRSSI) ? (millis() - last_rx_ms) : 0),
+        tx_time_ms,
+        minimum_pause_ms,
+        nullptr,
+        0);
   }
   else
   {
     Serial.printf("PING tx %u bytes seq=%u (air=%lums)\n",
                   (unsigned)sizeof(pkt), (unsigned)pkt.seq, (unsigned long)tx_time_ms);
+
     last_tx_seq = pkt.seq;
 
-    String s = String(millis()) + ",PING_TX,seq=" + String(pkt.seq) + " bytes=" + String((unsigned)sizeof(pkt)) +
-               " airMs=" + String((unsigned long)tx_time_ms);
-    sdAppendLine(s);
+    appendCsvRow(
+        "PING_TX",
+        uptime_s,
+        seq,
+        "ok",
+        (int)sizeof(pkt),
+        lastRSSI,
+        lastSNR,
+        (!isnan(lastRSSI) ? (millis() - last_rx_ms) : 0),
+        tx_time_ms,
+        minimum_pause_ms,
+        nullptr,
+        0);
   }
 
   minimum_pause_ms = tx_time_ms * 2;
@@ -582,38 +819,56 @@ static void handleTX()
 
 static void logAckWithPingContext(const AckPacket &ack, float ack_rssi, float ack_snr)
 {
-  const uint32_t rtt_ms = (last_tx_start_ms > 0) ? (millis() - last_tx_start_ms) : 0;
+  const uint32_t now = millis();
+  const uint32_t rtt_ms = (last_tx_start_ms > 0) ? (now - last_tx_start_ms) : 0;
 
-  const char *ping_fe = (ack.ping_freqerr_Hz == 0x7FFFFFFF) ? "INV" : String((long)ack.ping_freqerr_Hz).c_str();
+  String pingFeStr = (ack.ping_freqerr_Hz == 0x7FFFFFFF) ? String("INV") : String((long)ack.ping_freqerr_Hz);
 
-  String line;
-  line.reserve(220);
-  line += "PONG seq=";
-  line += String((unsigned)ack.seq);
-  line += " rtt=";
-  line += String((unsigned long)rtt_ms);
-  line += "ms | beaconTX{seq=";
-  line += String((unsigned)last_tx_seq);
-  line += "} | rxPing{R=";
-  line += String((int)ack.ping_rssi_dBm_x1);
-  line += "dBm S=";
-  line += String((double)ack.ping_snr_dB_x10 / 10.0, 1);
-  line += "dB FE=";
-  line += ping_fe;
-  line += "Hz len=";
-  line += String((unsigned)ack.ping_len);
-  line += " rxUp=";
-  line += String((unsigned long)ack.rx_uptime_s);
-  line += "s} | beaconRxAck{R=";
-  line += String(ack_rssi, 1);
-  line += "dBm S=";
-  line += String(ack_snr, 1);
-  line += "dB}";
+  String pretty;
+  pretty.reserve(240);
+  pretty += "PONG seq=";
+  pretty += String((unsigned)ack.seq);
+  pretty += " rtt=";
+  pretty += String((unsigned long)rtt_ms);
+  pretty += "ms | ";
+  pretty += "rxPing{R=";
+  pretty += String((int)ack.ping_rssi_dBm_x1);
+  pretty += "dBm ";
+  pretty += "S=";
+  pretty += String((double)ack.ping_snr_dB_x10 / 10.0, 1);
+  pretty += "dB ";
+  pretty += "FE=";
+  pretty += pingFeStr;
+  pretty += "Hz ";
+  pretty += "len=";
+  pretty += String((unsigned)ack.ping_len);
+  pretty += " rxUp=";
+  pretty += String((unsigned long)ack.rx_uptime_s);
+  pretty += "s} | ";
+  pretty += "beaconRxAck{R=";
+  pretty += String(ack_rssi, 1);
+  pretty += "dBm S=";
+  pretty += String(ack_snr, 1);
+  pretty += "dB}";
 
-  Serial.println(line);
+  Serial.println(pretty);
 
-  // CSV log entry
-  sdAppendLine(String(millis()) + ",PONG," + line);
+  // Rich CSV row for the PONG
+  uint32_t uptime_s = now / 1000;
+
+  appendCsvRow(
+      "PONG",
+      uptime_s,
+      ack.seq,
+      "ok",
+      (int)sizeof(AckPacket),
+      ack_rssi,
+      ack_snr,
+      0,
+      tx_time_ms,
+      minimum_pause_ms,
+      &ack,
+      rtt_ms);
 }
 
 static void handleRX()
@@ -622,9 +877,15 @@ static void handleRX()
     return;
   rxFlag = false;
 
-  uint8_t buf[64] = {0};
+  uint8_t buf[80] = {0};
   int16_t len = radio.getPacketLength(true);
-  size_t toRead = (len > 0 && (size_t)len < sizeof(buf)) ? (size_t)len : sizeof(buf);
+
+  size_t toRead = 0;
+  if (len > 0)
+    toRead = (len < (int)sizeof(buf)) ? (size_t)len : sizeof(buf);
+  else
+    toRead = sizeof(buf);
+
   radio.readData(buf, toRead);
 
   lastRSSI = radio.getRSSI();
@@ -634,8 +895,21 @@ static void handleRX()
   if (_radiolib_status != RADIOLIB_ERR_NONE)
   {
     Serial.printf("RX read fail: %d RSSI=%.1f SNR=%.1f len=%d\n", _radiolib_status, lastRSSI, lastSNR, (int)len);
-    sdAppendLine(String(millis()) + ",RX_FAIL,status=" + String(_radiolib_status) +
-                 " rssi=" + String(lastRSSI, 1) + " snr=" + String(lastSNR, 1) + " len=" + String((int)len));
+
+    appendCsvRow(
+        "RX_FAIL",
+        millis() / 1000,
+        last_tx_seq,
+        String("radiolib=").concat(String(_radiolib_status)).c_str(),
+        (int)len,
+        lastRSSI,
+        lastSNR,
+        0,
+        tx_time_ms,
+        minimum_pause_ms,
+        nullptr,
+        0);
+
     RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
     return;
   }
@@ -646,27 +920,65 @@ static void handleRX()
     if (decodeAck(buf, sizeof(AckPacket), ack))
     {
       if (ack.seq == last_tx_seq)
+      {
         logAckWithPingContext(ack, lastRSSI, lastSNR);
+      }
       else
       {
         Serial.printf("PONG (out-of-order) seq=%u (expected %u) RSSI=%.1f SNR=%.1f\n",
                       (unsigned)ack.seq, (unsigned)last_tx_seq, lastRSSI, lastSNR);
-        sdAppendLine(String(millis()) + ",PONG_OOO,seq=" + String((unsigned)ack.seq) +
-                     " expected=" + String((unsigned)last_tx_seq) +
-                     " rssi=" + String(lastRSSI, 1) + " snr=" + String(lastSNR, 1));
+
+        appendCsvRow(
+            "PONG_OOO",
+            millis() / 1000,
+            ack.seq,
+            String("expected=").concat(String((unsigned)last_tx_seq)).c_str(),
+            (int)sizeof(AckPacket),
+            lastRSSI,
+            lastSNR,
+            0,
+            tx_time_ms,
+            minimum_pause_ms,
+            &ack,
+            0);
       }
     }
     else
     {
       Serial.printf("RX invalid ACK (crc/magic) RSSI=%.1f SNR=%.1f\n", lastRSSI, lastSNR);
-      sdAppendLine(String(millis()) + ",ACK_BAD,rssi=" + String(lastRSSI, 1) + " snr=" + String(lastSNR, 1));
+
+      appendCsvRow(
+          "ACK_BAD",
+          millis() / 1000,
+          last_tx_seq,
+          "crc_or_magic",
+          (int)len,
+          lastRSSI,
+          lastSNR,
+          0,
+          tx_time_ms,
+          minimum_pause_ms,
+          nullptr,
+          0);
     }
   }
   else
   {
     Serial.printf("RX unknown len=%d RSSI=%.1f SNR=%.1f\n", (int)len, lastRSSI, lastSNR);
-    sdAppendLine(String(millis()) + ",RX_UNKNOWN,len=" + String((int)len) +
-                 " rssi=" + String(lastRSSI, 1) + " snr=" + String(lastSNR, 1));
+
+    appendCsvRow(
+        "RX_UNKNOWN",
+        millis() / 1000,
+        last_tx_seq,
+        "unexpected_len",
+        (int)len,
+        lastRSSI,
+        lastSNR,
+        0,
+        tx_time_ms,
+        minimum_pause_ms,
+        nullptr,
+        0);
   }
 
   RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
@@ -682,18 +994,21 @@ void setup()
   display.init();
   display.setFont(ArialMT_Plain_10);
 
+  // If ADC fallback is used, make sure pin is configured
+  analogReadResolution(12);
+  pinMode(VBAT_ADC_PIN, INPUT);
+
   gpsInit();
   gpsResetAverager();
   radioInit();
-
-  sdInit(); // <-- SD after core init; logs status to OLED
+  sdInit();
 
   drawStatusOLED();
 
   Serial.printf("TelemetryPacket size = %u bytes\n", (unsigned)sizeof(TelemetryPacket));
   Serial.printf("AckPacket size       = %u bytes\n", (unsigned)sizeof(AckPacket));
 
-  sdAppendLine(String(millis()) + ",BOOT,beacon started");
+  sdAppendLine(String(millis()) + ",BOOT,0,0," + String(readVBAT(), 3) + ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,boot");
 }
 
 void loop()
@@ -706,5 +1021,6 @@ void loop()
   handleTX();
   handleRX();
 
+  logStatusTick();
   oledTick();
 }
