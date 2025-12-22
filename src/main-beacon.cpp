@@ -1,14 +1,13 @@
 /**
- * Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) - BEACON
+ * Heltec WiFi LoRa 32 V4 (ESP32-S3 + SX1262) - BEACON (mobile logger)
  * - Raw LoRa TX/RX (no LoRaWAN)
  * - GPS (GT-U7) on UART pins 45/46
  * - microSD logging over custom SPI pins (4/5/2 + CS=6)
  * - Broadcast TelemetryPacket over LoRa + CRC16 (PING)
- * - On ACK (PONG), logs:
- *     1) Original ping seq
- *     2) Receiver-measured metrics for ping (beacon TX data)
- *     3) Beacon-measured metrics for ACK (beacon RX data)
- * - Rich CSV logging: GPS, VBAT, radio settings, TX airtime, RTT, RSSI/SNR, etc.
+ * - Multiple receivers respond with AckPacket (PONG). Beacon listens for a window
+ *   and logs *each* valid PONG to SD.
+ * - Rich CSV logging: GPS, VBAT, radio settings, TX airtime, per-receiver RTT,
+ *   RSSI/SNR/FreqError, etc.
  */
 
 #define HELTEC_POWER_BUTTON
@@ -210,6 +209,9 @@ struct __attribute__((packed)) AckPacket
   uint8_t flags;   // reserved
   uint16_t seq;    // echoed TelemetryPacket.seq
 
+  uint32_t receiver_id;       // receiver unique id (e.g. MCU DEVICEID hash)
+  uint16_t receiver_delay_ms; // how long receiver waited before TX (anti-collision)
+
   uint32_t rx_uptime_s; // receiver uptime when ACK built
 
   int16_t ping_rssi_dBm_x1; // RSSI seen by receiver on PING
@@ -286,7 +288,7 @@ static void sdInit()
           "radio_freq_MHz,radio_bw_kHz,radio_sf,radio_txpwr_dBm,"
           "tx_air_ms,min_pause_ms,"
           "rx_rssi_dBm,rx_snr_dB,rx_age_ms,rx_len,"
-          "pong_rx_uptime_s,pong_ping_rssi_dBm,pong_ping_snr_dB,pong_ping_freqerr_Hz,pong_ping_len,pong_rtt_ms,"
+          "pong_receiver_id,pong_receiver_delay_ms,pong_rx_uptime_s,pong_ping_rssi_dBm,pong_ping_snr_dB,pong_ping_freqerr_Hz,pong_ping_len,pong_rtt_ms,"
           "status");
       f.close();
     }
@@ -788,6 +790,10 @@ static void appendCsvRow(
   // PONG fields
   if (ack)
   {
+    line += String((unsigned long)ack->receiver_id);
+    line += ",";
+    line += String((unsigned long)ack->receiver_delay_ms);
+    line += ",";
     line += String((unsigned long)ack->rx_uptime_s);
     line += ",";
     line += String((int)ack->ping_rssi_dBm_x1);
@@ -807,7 +813,7 @@ static void appendCsvRow(
   else
   {
     // Empty columns when no ack
-    line += ",,,,,,";
+    line += ",,,,,,,,";
   }
 
   line += status ? status : "";
@@ -959,6 +965,11 @@ static void logAckWithPingContext(const AckPacket &ack, float ack_rssi, float ac
   pretty.reserve(240);
   pretty += "PONG seq=";
   pretty += String((unsigned)ack.seq);
+  pretty += " from=";
+  pretty += String((unsigned long)ack.receiver_id);
+  pretty += " dly=";
+  pretty += String((unsigned long)ack.receiver_delay_ms);
+  pretty += "ms";
   pretty += " rtt=";
   pretty += String((unsigned long)rtt_ms);
   pretty += "ms | ";
@@ -1008,7 +1019,7 @@ static void handleRX()
     return;
   rxFlag = false;
 
-  uint8_t buf[80] = {0};
+  uint8_t buf[128] = {0};
   int16_t len = radio.getPacketLength(true);
 
   size_t toRead = 0;
