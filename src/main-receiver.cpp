@@ -23,7 +23,7 @@
 #define BANDWIDTH 125.0   // kHz
 #define SPREADING_FACTOR 9
 // -------------------- Receiver ID (unique per receiver) --------------------
-#define RECEIVERID 0x0006u                  // change to a unique value per receiver
+#define RECEIVERID 0x0001u                  // change to a unique value per receiver
 #define DELAY_MS (RECEIVERID * 350u + 200u) // Anti-collision delay based on receiver ID
 // Anti-collision: receivers wait a deterministic delay before replying
 static const uint16_t MAX_PONG_DELAY_MS = 300; // spread replies across this window

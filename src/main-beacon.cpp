@@ -86,7 +86,8 @@ static const int SD_MOSI = 5;
 
 static SPIClass SDSPI(FSPI); // separate SPI peripheral
 static bool sd_ok = false;
-static const char *SD_PATH = "/beacon.csv";
+static String sd_path = "/beacon_0000.csv";
+static uint16_t file_num = 0;
 
 // -------------------- OLED timing --------------------
 static const uint32_t OLED_PERIOD_MS = 250;
@@ -121,6 +122,35 @@ static uint16_t last_ping_len_rx = 0;
 static float last_pong_rssi_beacon = NAN; // beacon-measured RSSI of PONG
 static float last_pong_snr_beacon = NAN;  // beacon-measured SNR of PONG
 static uint32_t last_pong_rtt_ms = 0;
+
+// -------------------- Receiver tracking (active pingers) --------------------
+static const uint32_t RECEIVER_ACTIVE_TIMEOUT_MS = 8000; // consider receiver active if seen within this window
+static const size_t MAX_RECEIVERS = 64;
+
+struct ReceiverStats
+{
+  bool used = false;
+  uint32_t id = 0;
+  uint32_t lastSeenMs = 0;
+  uint32_t pongCount = 0;
+  float lastAckRssi = NAN; // beacon-measured RSSI of PONG
+  float lastAckSnr = NAN;
+  uint32_t lastRttMs = 0;
+  uint16_t lastDelayMs = 0;
+  float bestAckRssi = NAN; // strongest (max) RSSI seen from this receiver
+};
+
+static ReceiverStats g_receivers[MAX_RECEIVERS];
+static uint32_t g_strongest_id = 0;
+static float g_strongest_rssi = NAN;
+
+static uint32_t g_display_cycle_id = 0; // 0 = summary, otherwise show receiver with this id
+
+// Button (GPIO0) to cycle receiver views
+static const int BTN_CYCLE = 0;
+static bool btn_last = true; // pullup: true=not pressed
+static uint32_t btn_last_change_ms = 0;
+static const uint32_t BTN_DEBOUNCE_MS = 80;
 
 // OLED tick
 static uint32_t last_oled_ms = 0;
@@ -252,7 +282,7 @@ static void sdAppendLine(const String &line)
   if (!sd_ok)
     return;
 
-  File f = SD.open(SD_PATH, FILE_APPEND);
+  File f = SD.open(sd_path.c_str(), FILE_APPEND);
   if (!f)
   {
     sd_ok = false;
@@ -260,6 +290,81 @@ static void sdAppendLine(const String &line)
   }
   f.println(line);
   f.close();
+}
+
+// Pick a new unique log filename on each boot: /beacon_0001.csv, /beacon_0002.csv, ...
+static void sdPickNewLogFile()
+{
+  uint16_t maxIdx = 0;
+
+  File root = SD.open("/");
+  if (!root)
+  {
+    sd_path = "/beacon_0000.csv";
+    return;
+  }
+
+  for (File f = root.openNextFile(); f; f = root.openNextFile())
+  {
+    const char *name = f.name();
+    // Expect names like "/beacon_0123.csv" or "beacon_0123.csv" depending on FS
+    if (!name)
+    {
+      f.close();
+      continue;
+    }
+
+    const char *base = name;
+    // Strip leading path
+    const char *slash = strrchr(name, '/');
+    if (slash)
+      base = slash + 1;
+
+    if (strncmp(base, "beacon_", 7) != 0)
+    {
+      f.close();
+      continue;
+    }
+    size_t L = strlen(base);
+    if (L < 7 + 4 + 4) // beacon_0000.csv
+    {
+      f.close();
+      continue;
+    }
+    const char *dot = strrchr(base, '.');
+    if (!dot || strcmp(dot, ".csv") != 0)
+    {
+      f.close();
+      continue;
+    }
+
+    // Parse 4 digits after "beacon_"
+    char idxStr[5] = {0};
+    memcpy(idxStr, base + 7, 4);
+    bool ok = true;
+    for (int i = 0; i < 4; i++)
+    {
+      if (idxStr[i] < '0' || idxStr[i] > '9')
+      {
+        ok = false;
+        break;
+      }
+    }
+    if (ok)
+    {
+      uint16_t idx = (uint16_t)atoi(idxStr);
+      if (idx > maxIdx)
+        maxIdx = idx;
+    }
+    f.close();
+  }
+  root.close();
+
+  file_num = maxIdx;
+
+  char path[32];
+  snprintf(path, sizeof(path), "/beacon_%04u.csv", (unsigned)(maxIdx + 1));
+  sd_path = String(path);
 }
 
 static void sdInit()
@@ -276,26 +381,27 @@ static void sdInit()
   sd_ok = true;
   Serial.println("SD init OK.");
 
-  if (!SD.exists(SD_PATH))
+  // Always create a fresh log file each boot.
+  sdPickNewLogFile();
+  Serial.printf("Logging to %s\n", sd_path.c_str());
+
+  File f = SD.open(sd_path.c_str(), FILE_WRITE);
+  if (f)
   {
-    File f = SD.open(SD_PATH, FILE_WRITE);
-    if (f)
-    {
-      // Rich CSV header (stable columns)
-      f.println(
-          "gps_utc_valid,gps_utc_year,gps_utc_mon,gps_utc_day,gps_utc_hour,gps_utc_min,gps_utc_sec,gps_utc_centis,gps_utc_age_ms,"
-          "ms,event,"
-          "uptime_s,seq,"
-          "vbat_V,"
-          "gps_has_fix,gps_avg_used,gps_quality,gps_sats,gps_hdop,gps_alt_m,gps_lat,gps_lon,"
-          "gps_avg_samples,gps_avg_hdop,gps_avg_alt_m,gps_avg_lat,gps_avg_lon,"
-          "radio_freq_MHz,radio_bw_kHz,radio_sf,radio_txpwr_dBm,"
-          "tx_air_ms,min_pause_ms,"
-          "rx_rssi_dBm,rx_snr_dB,rx_age_ms,rx_len,"
-          "pong_receiver_id,pong_receiver_delay_ms,pong_rx_uptime_s,pong_ping_rssi_dBm,pong_ping_snr_dB,pong_ping_freqerr_Hz,pong_ping_len,pong_rtt_ms,"
-          "status");
-      f.close();
-    }
+    // Rich CSV header (stable columns)
+    f.println(
+        "gps_utc_valid,gps_utc_year,gps_utc_mon,gps_utc_day,gps_utc_hour,gps_utc_min,gps_utc_sec,gps_utc_centis,gps_utc_age_ms,"
+        "ms,event,"
+        "uptime_s,seq,"
+        "vbat_V,"
+        "gps_has_fix,gps_avg_used,gps_quality,gps_sats,gps_hdop,gps_alt_m,gps_lat,gps_lon,"
+        "gps_avg_samples,gps_avg_hdop,gps_avg_alt_m,gps_avg_lat,gps_avg_lon,"
+        "radio_freq_MHz,radio_bw_kHz,radio_sf,radio_txpwr_dBm,"
+        "tx_air_ms,min_pause_ms,"
+        "rx_rssi_dBm,rx_snr_dB,rx_age_ms,rx_len,"
+        "pong_receiver_id,pong_receiver_delay_ms,pong_rx_uptime_s,pong_ping_rssi_dBm,pong_ping_snr_dB,pong_ping_freqerr_Hz,pong_ping_len,pong_rtt_ms,"
+        "status");
+    f.close();
   }
 }
 
@@ -313,14 +419,14 @@ static const char *gpsQualityLabel(GpsQuality q)
   switch (q)
   {
   case GPS_EXCELLENT:
-    return "EXCELLENT";
+    return "EXCL";
   case GPS_NORMAL:
-    return "NORMAL";
+    return "NORM";
   case GPS_POOR:
     return "POOR";
   case GPS_NOFIX:
   default:
-    return "NOFIX";
+    return "NFIX";
   }
 }
 
@@ -492,6 +598,107 @@ static const char *sigQualityLabel(SigQuality q)
   }
 }
 
+// -------------------- Receiver tracking helpers --------------------
+static ReceiverStats *findReceiver(uint32_t id)
+{
+  for (size_t i = 0; i < MAX_RECEIVERS; i++)
+  {
+    if (g_receivers[i].used && g_receivers[i].id == id)
+      return &g_receivers[i];
+  }
+  return nullptr;
+}
+
+static ReceiverStats *upsertReceiver(uint32_t id)
+{
+  if (id == 0)
+    return nullptr;
+  if (ReceiverStats *r = findReceiver(id))
+    return r;
+
+  for (size_t i = 0; i < MAX_RECEIVERS; i++)
+  {
+    if (!g_receivers[i].used)
+    {
+      g_receivers[i] = ReceiverStats{};
+      g_receivers[i].used = true;
+      g_receivers[i].id = id;
+      return &g_receivers[i];
+    }
+  }
+  return nullptr;
+}
+
+static bool isReceiverActive(const ReceiverStats &r, uint32_t now)
+{
+  return r.used && (now - r.lastSeenMs) <= RECEIVER_ACTIVE_TIMEOUT_MS;
+}
+
+static size_t activeReceiverCount(uint32_t now)
+{
+  size_t c = 0;
+  for (size_t i = 0; i < MAX_RECEIVERS; i++)
+    if (isReceiverActive(g_receivers[i], now))
+      c++;
+  return c;
+}
+
+static bool strongestActiveReceiver(uint32_t now, uint32_t &outId, float &outRssi)
+{
+  bool found = false;
+  float best = -9999.0f;
+  uint32_t bestId = 0;
+
+  for (size_t i = 0; i < MAX_RECEIVERS; i++)
+  {
+    const ReceiverStats &r = g_receivers[i];
+    if (!isReceiverActive(r, now) || isnan(r.lastAckRssi))
+      continue;
+    if (!found || r.lastAckRssi > best)
+    {
+      found = true;
+      best = r.lastAckRssi;
+      bestId = r.id;
+    }
+  }
+
+  outId = bestId;
+  outRssi = found ? best : NAN;
+  return found;
+}
+
+static uint32_t nextActiveReceiverId(uint32_t now, uint32_t afterId)
+{
+  // Cycle order (stable, by array/insertion order):
+  // summary(0) -> first active -> ... -> last active -> summary(0)
+  uint32_t first = 0;
+  uint32_t prev = 0;
+  for (size_t i = 0; i < MAX_RECEIVERS; i++)
+  {
+    const ReceiverStats &r = g_receivers[i];
+    if (!isReceiverActive(r, now))
+      continue;
+
+    if (first == 0)
+      first = r.id;
+
+    if (afterId == 0)
+      return first;
+
+    if (prev == afterId)
+      return r.id;
+
+    prev = r.id;
+  }
+
+  // If no active receivers, stay in summary
+  if (first == 0)
+    return 0;
+
+  // afterId was the last receiver -> go back to summary
+  return 0;
+}
+
 static void drawStatusOLED()
 {
   display.clear();
@@ -526,35 +733,44 @@ static void drawStatusOLED()
 
   display.drawString(0, 24, "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr);
 
-  // --- PING stats (receiver reported it received) ---
-  // Only valid if we've received at least one good PONG recently
-  bool pong_fresh = last_pong_valid && ((now - last_pong_ms) < 15000);
+  // Receiver summary / detail view
+  size_t active = activeReceiverCount(now);
+  uint32_t bestId = 0;
+  float bestRssi = NAN;
+  strongestActiveReceiver(now, bestId, bestRssi);
 
-  if (pong_fresh)
+  if (g_display_cycle_id == 0)
   {
-    // PING quality as reported by receiver (what RX saw from our PING)
-    SigQuality pingQ = signalQuality(last_ping_rssi_rx, last_ping_snr_rx);
-
-    // PONG quality as measured locally (what we saw from their PONG)
-    SigQuality pongQ = signalQuality(last_pong_rssi_beacon, last_pong_snr_beacon);
-
-    display.drawString(
-        0, 36,
-        "R:" + String(last_ping_rssi_rx, 0) +
-            " S:" + String(last_ping_snr_rx, 1) +
-            String(sigQualityLabel(pingQ)));
-
-    display.drawString(
-        0, 48,
-        "R:" + String(last_pong_rssi_beacon, 0) +
-            " S:" + String(last_pong_snr_beacon, 1) +
-            String(sigQualityLabel(pongQ)));
+    // Summary view: active count + strongest RSSI/ID
+    display.drawString(0, 36, "Active: " + String((unsigned)active));
+    if (bestId != 0 && !isnan(bestRssi))
+    {
+      display.drawString(0, 48, "Best: " + String(bestId, HEX) + " " + String(bestRssi, 0) + "dBm");
+    }
+    else
+    {
+      display.drawString(0, 48, "Best: --");
+    }
+    display.setTextAlignment(TEXT_ALIGN_RIGHT);
+    display.drawString(128, 48, String(file_num));
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
   }
   else
   {
-    // Fallback: show something useful while waiting for first PONG
-    display.drawString(0, 36, "PING@RX");
-    display.drawString(0, 48, "PONG@ME");
+    // Detail view for selected receiver
+    ReceiverStats *r = findReceiver(g_display_cycle_id);
+    if (!r || !isReceiverActive(*r, now))
+    {
+      g_display_cycle_id = 0;
+      display.drawString(0, 36, "Active: " + String((unsigned)active));
+      display.drawString(0, 48, "Best: --");
+    }
+    else
+    {
+      uint32_t age = now - r->lastSeenMs;
+      display.drawString(0, 36, "ID: " + String(r->id, HEX) + " C:" + String((unsigned long)r->pongCount));
+      display.drawString(0, 48, "R:" + String(r->lastAckRssi, 0) + " S:" + String(r->lastAckSnr, 1) + " T:" + String((unsigned long)r->lastRttMs) + " A:" + String((unsigned long)(age / 1000)) + "s");
+    }
   }
 
   display.display();
@@ -567,6 +783,44 @@ static void oledTick()
     return;
   last_oled_ms = now;
   drawStatusOLED();
+}
+
+// -------------------- Button helpers --------------------
+static void buttonInit()
+{
+  pinMode(BTN_CYCLE, INPUT_PULLUP);
+  btn_last = true;
+  btn_last_change_ms = millis();
+}
+
+static void buttonTick()
+{
+  const uint32_t now = millis();
+  static bool latched = false;
+  bool cur = (digitalRead(BTN_CYCLE) != LOW); // true = not pressed
+
+  if (cur != btn_last)
+  {
+    btn_last_change_ms = now;
+    btn_last = cur;
+  }
+
+  // Detect falling edge (press) with debounce
+  if (!cur && (now - btn_last_change_ms) > BTN_DEBOUNCE_MS)
+  {
+    // Wait for release before allowing next press
+    if (!latched)
+    {
+      latched = true;
+      uint32_t nextId = nextActiveReceiverId(now, g_display_cycle_id);
+      g_display_cycle_id = nextId; // 0 if none
+    }
+  }
+  else if (cur)
+  {
+    // released
+    latched = false;
+  }
 }
 
 // -------------------- Radio helpers --------------------
@@ -806,7 +1060,7 @@ static void appendCsvRow(
   {
     line += String((unsigned long)ack->receiver_id);
     line += ",";
-    line += String((unsigned long)ack->receiver_delay_ms);
+    line += String((unsigned)ack->receiver_delay_ms);
     line += ",";
     line += String((unsigned long)ack->rx_uptime_s);
     line += ",";
@@ -972,6 +1226,19 @@ static void logAckWithPingContext(const AckPacket &ack, float ack_rssi, float ac
   last_pong_rssi_beacon = ack_rssi;
   last_pong_snr_beacon = ack_snr;
   last_pong_rtt_ms = rtt_ms;
+
+  // Update per-receiver stats (active receivers)
+  if (ReceiverStats *rs = upsertReceiver(ack.receiver_id))
+  {
+    rs->lastSeenMs = now;
+    rs->pongCount++;
+    rs->lastAckRssi = ack_rssi;
+    rs->lastAckSnr = ack_snr;
+    rs->lastRttMs = rtt_ms;
+    rs->lastDelayMs = ack.receiver_delay_ms;
+    if (isnan(rs->bestAckRssi) || ack_rssi > rs->bestAckRssi)
+      rs->bestAckRssi = ack_rssi;
+  }
 
   String pingFeStr = (ack.ping_freqerr_Hz == 0x7FFFFFFF) ? String("INV") : String((long)ack.ping_freqerr_Hz);
 
@@ -1164,13 +1431,26 @@ void setup()
   gpsResetAverager();
   radioInit();
   sdInit();
+  buttonInit();
 
   drawStatusOLED();
 
   Serial.printf("TelemetryPacket size = %u bytes\n", (unsigned)sizeof(TelemetryPacket));
   Serial.printf("AckPacket size       = %u bytes\n", (unsigned)sizeof(AckPacket));
 
-  sdAppendLine(String(millis()) + ",BOOT,0,0," + String(readVBAT(), 3) + ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,boot");
+  appendCsvRow(
+      "BOOT",
+      millis() / 1000,
+      0,
+      sd_ok ? sd_path.c_str() : "no_sd",
+      0,
+      NAN,
+      NAN,
+      0,
+      0,
+      0,
+      nullptr,
+      0);
 }
 
 void loop()
@@ -1184,5 +1464,6 @@ void loop()
   handleRX();
 
   logStatusTick();
+  buttonTick();
   oledTick();
 }
