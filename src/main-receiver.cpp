@@ -22,7 +22,9 @@
 #define FREQUENCY 910.525 // MHz
 #define BANDWIDTH 125.0   // kHz
 #define SPREADING_FACTOR 9
-
+// -------------------- Receiver ID (unique per receiver) --------------------
+#define RECEIVERID 0x0006u                  // change to a unique value per receiver
+#define DELAY_MS (RECEIVERID * 350u + 200u) // Anti-collision delay based on receiver ID
 // Anti-collision: receivers wait a deterministic delay before replying
 static const uint16_t MAX_PONG_DELAY_MS = 300; // spread replies across this window
 
@@ -153,20 +155,14 @@ static uint32_t receiverId()
   return x;
 #else
   // Fallback: not unique, but deterministic.
-  return 0x4631u;
+  return RECEIVERID;
 #endif
 }
 
 static uint16_t computeDelayMs(uint32_t rid, uint16_t seq)
 {
-  // Deterministic per (receiver, ping) to avoid everyone picking the same delay.
-  uint32_t v = rid ^ ((uint32_t)seq << 16) ^ (uint32_t)seq;
-  v ^= (v >> 17);
-  v *= 0xED5AD4BBu;
-  v ^= (v >> 11);
-  v *= 0xAC4C1B51u;
-  v ^= (v >> 15);
-  return (uint16_t)(v % (MAX_PONG_DELAY_MS + 1));
+  // Static. Calculate based on Receiver ID * 100ms.
+  return DELAY_MS;
 }
 
 static void buildAck(AckPacket &ack,
@@ -285,16 +281,50 @@ void loop()
     return;
   }
 
+  // Quick magic check so we don't spam logs when we hear other traffic (e.g., other receivers' PONGs)
+  uint32_t magic = 0;
+  if (len >= 4)
+  {
+    memcpy(&magic, buf, sizeof(magic));
+  }
+
+  // If we heard an ACK/PONG (from another receiver, or our own due to close RF coupling), ignore it.
+  if (magic == ACK_MAGIC)
+  {
+    radio.startReceive();
+    return;
+  }
+
+  // If it isn't a telemetry ping, ignore silently.
+  if (magic != TLMS_MAGIC)
+  {
+    radio.startReceive();
+    return;
+  }
+
   TelemetryPacket ping;
   if (!decodeTelemetry(buf, (size_t)len, ping))
   {
-    Serial.println("RX not a valid PING (crc/magic/len)");
+    Serial.print("RX invalid TLMS PING (len/crc). len=");
+    Serial.print(len);
+    Serial.print(" expected=");
+    Serial.println((int)sizeof(TelemetryPacket));
     radio.startReceive();
     return;
   }
 
   const uint32_t rid = receiverId();
   const uint16_t dly = computeDelayMs(rid, ping.seq);
+
+  Serial.print("Delayed PONG seq=");
+  Serial.print((unsigned)ping.seq);
+  Serial.print(" delay=");
+  Serial.print((unsigned)dly);
+  Serial.print("ms rssi=");
+  Serial.print(rssi, 1);
+  Serial.print(" snr=");
+  Serial.println(snr, 1);
+  Serial.println();
 
   // Backoff to reduce collisions among multiple receivers
   delay(dly);

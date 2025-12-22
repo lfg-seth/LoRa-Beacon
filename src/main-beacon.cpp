@@ -21,7 +21,7 @@
 #include <math.h>
 
 // -------------------- LoRa settings --------------------
-#define PAUSE 1           // seconds (0 = only button)
+#define PAUSE 5           // seconds (0 = only button)
 #define FREQUENCY 910.525 // MHz
 #define BANDWIDTH 125.0   // kHz
 #define SPREADING_FACTOR 9
@@ -81,7 +81,7 @@ static int gps_hour = 0, gps_min = 0, gps_sec = 0, gps_centi = 0;
 // -------------------- microSD (custom SPI bus) --------------------
 static const int SD_CS = 6;
 static const int SD_SCK = 4;
-static const int SD_MISO = 2;
+static const int SD_MISO = 45;
 static const int SD_MOSI = 5;
 
 static SPIClass SDSPI(FSPI); // separate SPI peripheral
@@ -581,6 +581,7 @@ static void radioInit()
   RADIOLIB_OR_HALT(radio.setBandwidth(BANDWIDTH));
   RADIOLIB_OR_HALT(radio.setSpreadingFactor(SPREADING_FACTOR));
   RADIOLIB_OR_HALT(radio.setOutputPower(TRANSMIT_POWER));
+  RADIOLIB_OR_HALT(radio.setPaConfig(0x04, RADIOLIB_SX126X_PA_CONFIG_SX1262, 0x07, 0x01)); // PA Boost, MaxPower, OutputPower
 
   RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
 }
