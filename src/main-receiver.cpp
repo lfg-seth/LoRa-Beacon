@@ -123,21 +123,19 @@ static const uint32_t ACK_MAGIC = 0x314B4341; // 'ACK1'
 // (If your BSP maps these differently, adjust here or use the BSP's WB_* defines.)
 //
 // We only need NSS/DIO1/RST/BUSY for RadioLib's Module constructor.
-#ifndef NRF_GPIO_PIN_MAP
-// Some cores don't expose NRF_GPIO_PIN_MAP; fall back to raw Arduino pin numbers.
-// If you hit compile errors, check your board's variant.h and set these to the Arduino GPIO numbers.
-#define LORA_NSS 10
-#define LORA_DIO1 15
-#define LORA_RST 6
-#define LORA_BUSY 14
-#else
-#define LORA_NSS NRF_GPIO_PIN_MAP(1, 10)
-#define LORA_DIO1 NRF_GPIO_PIN_MAP(1, 15)
-#define LORA_RST NRF_GPIO_PIN_MAP(1, 6)
-#define LORA_BUSY NRF_GPIO_PIN_MAP(1, 14)
-#endif
+// SX1262 wiring on RAK4631 (nRF52840)
+#define PIN_LORA_NSS NRF_GPIO_PIN_MAP(1, 10)
+#define PIN_LORA_SCK NRF_GPIO_PIN_MAP(1, 11)
+#define PIN_LORA_MOSI NRF_GPIO_PIN_MAP(1, 12)
+#define PIN_LORA_MISO NRF_GPIO_PIN_MAP(1, 13)
 
-SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
+#define PIN_LORA_RST NRF_GPIO_PIN_MAP(1, 6)
+#define PIN_LORA_ANT_SW NRF_GPIO_PIN_MAP(1, 5)
+#define PIN_LORA_DIO1 NRF_GPIO_PIN_MAP(1, 15)
+#define PIN_LORA_BUSY NRF_GPIO_PIN_MAP(1, 14)
+
+SPIClass LoraSPI(NRF_SPIM1, PIN_LORA_MISO, PIN_LORA_SCK, PIN_LORA_MOSI);
+SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY, LoraSPI);
 
 static uint32_t receiverId()
 {
@@ -223,6 +221,12 @@ void setup()
   delay(150);
 
   // Radio init
+  // Power RF switch (important on many RAK boards)
+  pinMode(PIN_LORA_ANT_SW, OUTPUT);
+  digitalWrite(PIN_LORA_ANT_SW, HIGH);
+  delay(10);
+  LoraSPI.begin();
+
   int state = radio.begin(FREQUENCY, BANDWIDTH, SPREADING_FACTOR);
   if (state != RADIOLIB_ERR_NONE)
   {
