@@ -305,7 +305,7 @@ void gpsPowerInit()
 {
   pinMode(GPS_POWER_PIN, OUTPUT);
   digitalWrite(GPS_POWER_PIN, LOW); // Power ON
-  delay(5000);
+  delay(50);
   Serial.printf("GPS power ON (PIN %d)\n", GPS_POWER_PIN);
 }
 static const char *gpsQualityLabel(GpsQuality q)
