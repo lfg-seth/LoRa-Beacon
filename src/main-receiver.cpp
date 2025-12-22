@@ -1,13 +1,13 @@
 /**
  * Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) - RECEIVER
  * - Raw LoRa RX/TX (no LoRaWAN)
- * - Receives TelemetryPacket (binary, 40 bytes) + CRC16 (PING)
+ * - Receives TelemetryPacket (binary) + CRC16 (PING)
  * - Logs every packet with useful RF metrics (RSSI/SNR/FreqError/Len)
  * - Each time a valid PING is received, immediately sends an AckPacket (PONG)
  *   containing the receiver-measured RF metrics for that PING.
  *
  * Assumes the beacon uses:
- *   FREQUENCY 910.525 MHz, BW 125 kHz, SF9, PWR 10 dBm
+ *   FREQUENCY 910.525 MHz, BW 125 kHz, SF9
  */
 
 #define HELTEC_POWER_BUTTON
@@ -15,6 +15,7 @@
 #include <heltec_unofficial.h>
 
 #include <Arduino.h>
+#include <math.h>
 
 // -------------------- Radio settings (MUST match beacon) --------------------
 #define FREQUENCY 910.525 // MHz
@@ -26,7 +27,7 @@ static const uint32_t OLED_PERIOD_MS = 250;
 
 // -------------------- RX globals --------------------
 volatile bool rxFlag = false;
-uint32_t last_oled_ms = 0;
+static uint32_t last_oled_ms = 0;
 
 static float rxRSSI = NAN;
 static float rxSNR = NAN;
@@ -74,6 +75,40 @@ static const char *gpsQualityLabel(uint8_t q)
   }
 }
 
+// -------------------- Simple Signal Quality (OLED) --------------------
+enum SigQuality : uint8_t
+{
+  SIG_POOR = 0,
+  SIG_GOOD = 1,
+  SIG_EXCELLENT = 2
+};
+
+static SigQuality signalQuality(float rssi_dBm, float snr_dB)
+{
+  if (isnan(rssi_dBm) || isnan(snr_dB))
+    return SIG_POOR;
+
+  // Same thresholds as beacon OLED (tune later)
+  if (snr_dB >= 4.0f && rssi_dBm >= -110.0f)
+    return SIG_EXCELLENT;
+  if (snr_dB >= -2.0f && rssi_dBm >= -120.0f)
+    return SIG_GOOD;
+  return SIG_POOR;
+}
+
+static const char *sigQualityLabel(SigQuality q)
+{
+  switch (q)
+  {
+  case SIG_EXCELLENT:
+    return "EXCL";
+  case SIG_GOOD:
+    return "GOOD";
+  default:
+    return "POOR";
+  }
+}
+
 struct __attribute__((packed)) TelemetryPacket
 {
   uint32_t magic;    // 'TLMS' = 0x534D4C54 (little-endian)
@@ -101,6 +136,20 @@ struct __attribute__((packed)) TelemetryPacket
 
   uint16_t crc; // CRC16-CCITT of all prior bytes
 };
+
+static float pktRssiFromTelemetry(const TelemetryPacket &p)
+{
+  if (p.rssi_dBm_x1 == (int16_t)0x7FFF)
+    return NAN;
+  return (float)p.rssi_dBm_x1;
+}
+
+static float pktSnrFromTelemetry(const TelemetryPacket &p)
+{
+  if (p.snr_dB_x10 == (int16_t)0x7FFF)
+    return NAN;
+  return (float)p.snr_dB_x10 / 10.0f;
+}
 
 static const uint32_t TLMS_MAGIC = 0x534D4C54; // 'TLMS'
 
@@ -132,7 +181,7 @@ struct __attribute__((packed)) AckPacket
   int16_t ping_rssi_dBm_x1; // RSSI seen on PING
   int16_t ping_snr_dB_x10;  // SNR*10 seen on PING
   int32_t ping_freqerr_Hz;  // freq error on PING (if available) else 0x7FFFFFFF
-  uint16_t ping_len;        // PING length in bytes (expected 40)
+  uint16_t ping_len;        // PING length in bytes
 
   uint16_t crc; // CRC16-CCITT of all prior bytes
 };
@@ -179,64 +228,72 @@ static bool hasPkt = false;
 // -------------------- ISR --------------------
 void rx() { rxFlag = true; }
 
-// -------------------- OLED helpers --------------------
+// -------------------- OLED helpers (Beacon-style, last line at y=48) --------------------
 static void drawOLED()
 {
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.setFont(ArialMT_Plain_10);
 
-  display.drawString(0, 0, "LoRa PING/PONG RX");
-
-  // Top-right: link stats
-  display.setTextAlignment(TEXT_ALIGN_RIGHT);
-  String link = String(good_pkts) + "/" + String(bad_pkts);
-  display.drawString(128, 0, link);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  uint32_t now = millis();
 
   if (!hasPkt)
   {
-    display.drawString(0, 14, "Waiting for packets...");
+    display.drawString(0, 0, "Lat: -----.----- " + String(good_pkts) + "/" + String(bad_pkts));
+    display.drawString(0, 12, "Lon: -----.----- PK:--");
+    display.drawString(0, 24, "Alt:-- HDOP:-- S:--");
+    display.drawString(0, 36, "PING --");
+    display.drawString(0, 48, "PONG --");
     display.display();
     return;
   }
 
-  // Decode scaled values
+  // Decode scaled values from lastPkt (beacon GPS data)
   const double lat = (double)lastPkt.lat_e7 / 1e7;
   const double lon = (double)lastPkt.lon_e7 / 1e7;
   const double alt_m = (lastPkt.alt_dm == (int16_t)0x7FFF) ? NAN : ((double)lastPkt.alt_dm / 10.0);
   const double hdop = (lastPkt.hdop_c == 0xFFFF) ? NAN : ((double)lastPkt.hdop_c / 100.0);
-  const int cur_mA = (int)lastPkt.current_mA;
 
   const bool hasFix = (lastPkt.flags & (1u << 0)) != 0;
   const bool avgUsed = (lastPkt.flags & (1u << 1)) != 0;
 
-  // Line 2: quality + sats + hdop
-  String l2 = String(gpsQualityLabel(lastPkt.gps_quality)).substring(0, 4);
-  l2 += " S:" + String(lastPkt.sats);
-  l2 += " H:" + (isnan(hdop) ? String("--") : String(hdop, 2));
+  // Line 0: Lat + good/bad (in place of SD)
+  String latStr = hasFix ? String(lat, 5) : String("-----.-----");
+  display.drawString(0, 0, "Lat: " + latStr + " " + String(good_pkts) + "/" + String(bad_pkts));
+
+  // Line 12: Lon + packet age
+  String lonStr = hasFix ? String(lon, 5) : String("-----.-----");
+  uint32_t age_ms = (last_rx_ms > 0) ? (now - last_rx_ms) : 0;
+  display.drawString(0, 12, "Lon: " + lonStr + " PK:" + String((unsigned long)age_ms));
+
+  // Line 24: Alt/HDOP/Sats (+AVG)
+  String altStr = isnan(alt_m) ? String("--") : (String(alt_m, 0) + "m");
+  String hdopStr = isnan(hdop) ? String("--") : String(hdop, 2);
+  String satsStr = (lastPkt.sats > 0) ? String(lastPkt.sats) : String("--");
+
+  String l24 = "Alt:" + altStr + " HDOP:" + hdopStr + " S:" + satsStr;
   if (avgUsed)
-    l2 += " AVG";
-  display.drawString(0, 12, l2);
+    l24 += " AVG";
+  display.drawString(0, 24, l24);
 
-  // Line 3: Lat
-  display.drawString(0, 24, "Lat:" + (hasFix ? String(lat, 5) : String("-----.-----")));
+  // Line 36: PING quality (receiver measured RSSI/SNR for incoming PING)
+  SigQuality pingQ = signalQuality(rxRSSI, rxSNR);
+  display.drawString(
+      0, 36,
+      "PING " + String(sigQualityLabel(pingQ)) +
+          " R:" + (isnan(rxRSSI) ? String("--") : String(rxRSSI, 0)) +
+          " S:" + (isnan(rxSNR) ? String("--") : String(rxSNR, 1)));
 
-  // Line 4: Lon
-  display.drawString(0, 36, "Lon:" + (hasFix ? String(lon, 5) : String("-----.-----")));
+  // Line 48: PONG quality proxy = what beacon reports it last RX'd (usually your previous PONG)
+  float bRssi = pktRssiFromTelemetry(lastPkt);
+  float bSnr = pktSnrFromTelemetry(lastPkt);
+  SigQuality pongQ = signalQuality(bRssi, bSnr);
 
-  // Line 5: Alt + I/V
-  String altStr = isnan(alt_m) ? String("--") : String(alt_m, 0);
-  String l5 = "Alt:" + altStr + " I:" + String(cur_mA) + "mA";
-  display.drawString(0, 48, l5);
-
-  // Line 6: RSSI/SNR + seq
-  String l6 = "Seq:" + String(lastPkt.seq);
-  if (!isnan(rxRSSI))
-    l6 += " R:" + String(rxRSSI, 0);
-  if (!isnan(rxSNR))
-    l6 += " S:" + String(rxSNR, 1);
-  display.drawString(0, 56, l6);
+  display.drawString(
+      0, 48,
+      "PONG " + String(sigQualityLabel(pongQ)) +
+          " R:" + (isnan(bRssi) ? String("--") : String(bRssi, 0)) +
+          " S:" + (isnan(bSnr) ? String("--") : String(bSnr, 1)));
 
   display.display();
 }
@@ -267,8 +324,7 @@ static void radioInit()
 
 static int32_t tryGetFreqErrHz()
 {
-  // Not all RadioLib builds expose this per radio.
-  // If unavailable, return sentinel 0x7FFFFFFF.
+  // If RadioLib exposes it, use it; otherwise keep sentinel.
   int32_t fe = 0x7FFFFFFF;
 #if defined(RADIOLIB_VERSION)
   fe = (int32_t)radio.getFrequencyError();
@@ -294,7 +350,11 @@ static void logPacketToSerial(const TelemetryPacket &p, uint16_t got_len)
   const bool avgUsed = (p.flags & (1u << 1)) != 0;
   const bool charging = (p.flags & (1u << 2)) != 0;
 
-  const char *feStr = (rxFreqErrHz == 0x7FFFFFFF) ? "INV" : String((long)rxFreqErrHz).c_str();
+  char feBuf[24];
+  if (rxFreqErrHz == 0x7FFFFFFF)
+    snprintf(feBuf, sizeof(feBuf), "INV");
+  else
+    snprintf(feBuf, sizeof(feBuf), "%ld", (long)rxFreqErrHz);
 
   Serial.printf(
       "PING v%u seq=%u up=%lus flags{fix=%u avg=%u chg=%u} gps{%s sats=%u hdop=%s alt=%s lat=%s lon=%s} "
@@ -312,7 +372,7 @@ static void logPacketToSerial(const TelemetryPacket &p, uint16_t got_len)
       hasFix ? String(lon, 5).c_str() : "INV",
       cur_mA, volts,
       net_mAh, in_mAh, out_mAh,
-      (unsigned)got_len, rxRSSI, rxSNR, feStr);
+      (unsigned)got_len, rxRSSI, rxSNR, feBuf);
 }
 
 static void sendAck(uint16_t seq, uint16_t ping_len)
@@ -332,7 +392,8 @@ static void sendAck(uint16_t seq, uint16_t ping_len)
   }
   else
   {
-    Serial.printf("PONG tx %u bytes seq=%u (air=%lums)\n", (unsigned)sizeof(ack), (unsigned)seq, (unsigned long)dt);
+    Serial.printf("PONG tx %u bytes seq=%u (air=%lums)\n",
+                  (unsigned)sizeof(ack), (unsigned)seq, (unsigned long)dt);
   }
 
   radio.setDio1Action(rx);
@@ -369,7 +430,6 @@ static void handleRX()
     bad_pkts++;
     Serial.printf("RX len mismatch: got=%d expected=%u RSSI=%.1f SNR=%.1f\n",
                   (int)len, (unsigned)sizeof(TelemetryPacket), rxRSSI, rxSNR);
-
     RADIOLIB_OR_HALT(radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF));
     return;
   }
@@ -404,7 +464,6 @@ void setup()
   display.setFont(ArialMT_Plain_10);
 
   radioInit();
-
   drawOLED();
 
   Serial.printf("Expecting TelemetryPacket size = %u bytes\n", (unsigned)sizeof(TelemetryPacket));

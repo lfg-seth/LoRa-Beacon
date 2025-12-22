@@ -26,7 +26,7 @@
 #define FREQUENCY 910.525 // MHz
 #define BANDWIDTH 125.0   // kHz
 #define SPREADING_FACTOR 9
-#define TRANSMIT_POWER 10 // dBm
+#define TRANSMIT_POWER 22 // dBm
 
 // -------------------- GPS (GT-U7) --------------------
 static const int GPS_RX_PIN = 45; // ESP32 RX  <- GPS TX
