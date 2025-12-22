@@ -28,8 +28,12 @@
 #define TRANSMIT_POWER 22 // dBm
 
 // -------------------- GPS (GT-U7) --------------------
-static const int GPS_RX_PIN = 45; // ESP32 RX  <- GPS TX
-static const int GPS_TX_PIN = 46; // ESP32 TX  -> GPS RX (optional)
+static const int GPS_RX_PIN = 39;    // ESP32 RX  <- GPS TX
+static const int GPS_TX_PIN = 38;    // ESP32 TX  -> GPS RX (optional)
+static const int GPS_POWER_PIN = 34; // GPIO to control GPS power (if connected)
+static const int GPS_WAKE = 40;      // GPIO to control GPS wake (if connected)
+static const int GPS_PPS_PIN = 41;   // GPIO to read GPS PPS (if connected)
+static const int GPS_RESET_PIN = 42; // GPIO to reset GPS (if connected)
 static const uint32_t GPS_BAUD = 9600;
 
 static HardwareSerial GPSSerial(1);
@@ -296,6 +300,14 @@ static void sdInit()
 }
 
 // -------------------- GPS helpers --------------------
+
+void gpsPowerInit()
+{
+  pinMode(GPS_POWER_PIN, OUTPUT);
+  digitalWrite(GPS_POWER_PIN, LOW); // Power ON
+  delay(5000);
+  Serial.printf("GPS power ON (PIN %d)\n", GPS_POWER_PIN);
+}
 static const char *gpsQualityLabel(GpsQuality q)
 {
   switch (q)
@@ -331,6 +343,7 @@ static GpsQuality gpsQualityNow()
 
 static void gpsInit()
 {
+  gpsPowerInit();
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.printf("GPS init: UART1 %lu baud (RX=%d TX=%d)\n",
                 (unsigned long)GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN);
